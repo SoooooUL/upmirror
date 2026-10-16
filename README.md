@@ -114,6 +114,19 @@ bash tests/smoke.sh
 | 教育网联合镜像站不在 Arch 官方 mirror status 列表中 | `https://archlinux.org/mirrors/status/json/`，1190 条中 cernet 条目数为 0 |
 | 部分镜像站会断开 `Python-urllib` UA 的请求（即 reflector 失败的真正原因） | 实测 `mirrors.hust.edu.cn`：curl 200；urllib → `RemoteDisconnected`；urllib + `curl/8.14.1` UA → 200 |
 
+### 实测记录（2026-10-16，CN）
+
+用 `fakeroot -- pacman -Sy --dbpath <临时目录> --debug` 抓取 pacman 真实请求的 URL：
+
+- `core.db` / `extra.db` / `multilib.db` 及其 `.sig` 全部命中列表第 1 位的
+  `mirrors.jlu.edu.cn`，没有往下 fallback —— 排序生效。
+- 把临时 dbpath 里的 db 清空、并故意不传 `--disable-sandbox-filesystem`（模拟下载失败）后，
+  pacman 会把 8 个 Server 依次试完，**包括末尾的 `mirrors.cernet.edu.cn` 保底** ——
+  兜底链路确实会被触达。
+- 注意：用 fakeroot + 临时 dbpath 手工验证时需要加 `--disable-sandbox-filesystem`，
+  否则会因 pacman 自身的下载沙箱（`sandboxuser: alpm`）报“无法获取某些文件”，
+  与镜像无关；正常 `sudo pacman -Syu` 不受影响。
+
 ## 定时任务示例
 
 ```bash
