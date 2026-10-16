@@ -93,6 +93,27 @@ mirrorlist.latest.bak -> ...        # 最近一次
   如果目标文件原本不存在，则删除新建的文件。
 - `--dry-run` 不涉及任何写入，自然也不会触发回滚。
 
+## 测试
+
+```bash
+bash tests/smoke.sh
+```
+
+测试在沙箱目录里跑，并用假的 `sudo` 代替提权，不会触碰 `/etc`。
+重点覆盖只有真正写盘时才会执行到的代码路径（原子替换、备份回滚、
+临时文件清理），这类 bug 在 `--dry-run` 下永远不会暴露。
+
+## 实现依据（源码/实测核对）
+
+| 结论 | 依据 |
+|---|---|
+| pacman 会跟随 302 跳转（最多 10 次） | `lib/libalpm/dload.c`：`CURLOPT_FOLLOWLOCATION, 1L` / `CURLOPT_MAXREDIRS, 10L` |
+| mirrorlist 顺序即尝试优先级，靠前优先 | `lib/libalpm/alpm_list.c` 的 `alpm_list_add` 挂到链表尾；`dload.c` 的 `payload_next_server` 从头部依次取 |
+| 同一主机累计 3 次软错误即在本次事务内被跳过，DNS 失败等硬错误立即拉黑 | `dload.c`：`const int server_error_limit = 3;` |
+| 下载速度 < 1 B/s 持续 10 秒才放弃该镜像 | `dload.c`：`CURLOPT_LOW_SPEED_LIMIT 1L` / `CURLOPT_LOW_SPEED_TIME 10L` |
+| 教育网联合镜像站不在 Arch 官方 mirror status 列表中 | `https://archlinux.org/mirrors/status/json/`，1190 条中 cernet 条目数为 0 |
+| 部分镜像站会断开 `Python-urllib` UA 的请求（即 reflector 失败的真正原因） | 实测 `mirrors.hust.edu.cn`：curl 200；urllib → `RemoteDisconnected`；urllib + `curl/8.14.1` UA → 200 |
+
 ## 定时任务示例
 
 ```bash

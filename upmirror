@@ -200,11 +200,12 @@ declare -a TMP_FILES=()
 SCRIPT_OK=false
 
 # 创建临时文件并登记（退出时统一删除）
-new_tmp() {
-    local f
-    f="$(mktemp "$CACHE_DIR/$1.XXXXXX")" || die "mktemp failed in $CACHE_DIR"
-    TMP_FILES+=("$f")
-    printf '%s' "$f"
+# 注意：不能用命令替换（`f=$(new_tmp x)`）——那样函数跑在子 shell 里，
+# TMP_FILES 的修改会丢失，导致临时文件永远不被清理。改用 nameref 写回调用者变量。
+new_tmp() {   # $1=调用者变量名  $2=前缀
+    local -n _ref="$1"
+    _ref="$(mktemp "$CACHE_DIR/$2.XXXXXX")" || die "mktemp failed in $CACHE_DIR"
+    TMP_FILES+=("$_ref")
 }
 
 clean_tmp() {
@@ -550,7 +551,10 @@ compose_list() {
 
 # 原子替换
 install_atomic() {
-    local src="$1" dst="$2" tmp="$dst.upmirror.new"
+    local src="$1" dst="$2" tmp
+    # 注意: 不能写成 local src="$1" dst="$2" tmp="$dst.upmirror.new"
+    # 同一行内 $dst 尚未生效，set -u 会直接报“未绑定的变量”
+    tmp="$dst.upmirror.new"
     sudo cp -- "$src" "$tmp" \
         && sudo chmod 0644 "$tmp" \
         && sudo chown root:root "$tmp" \
@@ -608,7 +612,8 @@ main() {
     mkdir -p "$CACHE_DIR" 2>/dev/null || die "cannot create $CACHE_DIR"
     # 单一 trap：负责临时文件清理 + 失败的镜像列表回滚
     trap cleanup EXIT INT TERM HUP
-    local tmp_list tmp_cn; tmp_list="$(new_tmp list)"
+    local tmp_list tmp_cn
+    new_tmp tmp_list list
 
     # 5. 测速生成
     info "$(msg running)"
@@ -618,7 +623,7 @@ main() {
     fi
 
     # 6. 组装最终内容（头部注释 + 镜像 + 保底）
-    local final; final="$(new_tmp final)"
+    local final; new_tmp final final
     compose_list "$tmp_list" "$final" "$backend" "$cc" "$filter" "$FALLBACK_MIRROR"
 
     printf '\n%s%s%s\n' "$C_CYAN" "$(msg result_title)" "$C_NC"
@@ -645,14 +650,14 @@ main() {
 
     # 10. 可选：archlinuxcn
     if [[ "$OPT_CN" == true ]]; then
-        tmp_cn="$(new_tmp cn)"
+        new_tmp tmp_cn cn
         if rate-mirrors --concurrency="$OPT_CONCURRENCY" \
                         --max-mirrors-to-output="$OPT_MIRRORS" \
                         --disable-comments-in-file \
                         --save="$tmp_cn" archlinuxcn 2>/dev/null \
            && validate_list "$tmp_cn"; then
             register_target "$TARGET_CN_MIRRORLIST"
-            local final_cn; final_cn="$(new_tmp cnfinal)"
+            new_tmp final_cn cnfinal
             compose_list "$tmp_cn" "$final_cn" "rate-mirrors" "archlinuxcn" "$filter" "$FALLBACK_CN_MIRROR"
             if install_atomic "$final_cn" "$TARGET_CN_MIRRORLIST"; then
                 ok "$(msg cn_updated) ${C_GREEN}$TARGET_CN_MIRRORLIST${C_NC}"
@@ -676,4 +681,7 @@ main() {
     return 0
 }
 
-main "$@"
+# 被 source 时（例如测试脚本）不自动执行，只提供函数
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
