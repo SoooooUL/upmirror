@@ -1,0 +1,679 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  upmirror — Arch Linux 镜像源更新器
+#
+#  默认后端：rate-mirrors（Rust 实现的 map-aware 镜像测速工具）
+#  备用后端：reflector
+#
+#  主要特性：
+#    1. 自动识别所在地区（时区 → IP 定位兜底 → 手动指定）
+#    2. 带时间戳备份 + 失败/中断自动回滚（trap EXIT/INT/TERM）
+#    3. 写入前校验：空列表 / 无效列表绝不落盘
+#    4. 原子替换：先写临时文件再 mv 覆盖，避免半截文件
+#    5. 可选同步更新 archlinuxcn 镜像列表（--cn）
+#
+#  用法：upmirror [选项]（见 upmirror --help）
+# ==============================================================================
+
+set -uo pipefail
+
+PROG="${0##*/}"
+VERSION="1.0.0"
+
+# ---------- 路径与常量 ----------
+TARGET_MIRRORLIST="/etc/pacman.d/mirrorlist"
+TARGET_CN_MIRRORLIST="/etc/pacman.d/archlinuxcn-mirrorlist"
+PACMAN_CONF="/etc/pacman.conf"
+CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/upmirror"
+STAMP="$(date +%Y%m%d-%H%M%S)"
+KEEP_BACKUPS=10          # 每个目标文件保留的备份份数
+
+# ---------- 保底镜像 ----------
+# CERNET（中国教育和科研计算机网）联合镜像站：会自动 302 跳转到离你最近的
+# 可用成员镜像（清华/中科大/吉大/南大…），因此放在列表最末尾作为最后兜底。
+# 注意 ${repo}/${arch} 由 pacman 展开，这里必须用单引号保持字面量。
+readonly FALLBACK_MIRROR='https://mirrors.cernet.edu.cn/archlinux/$repo/os/$arch'
+readonly FALLBACK_CN_MIRROR='https://mirrors.cernet.edu.cn/archlinuxcn/$arch'
+
+# ---------- 默认选项 ----------
+OPT_CC=""                # 国家/地区 ISO 代码，空 = 自动检测
+OPT_MIRRORS=10           # 写入 mirrorlist 的镜像数量
+OPT_MAX_DELAY=43200      # 最大同步延迟（秒），12 小时
+OPT_PROTOCOL="https"     # https / http / both
+OPT_CONCURRENCY=16       # 并发测速数
+OPT_PER_COUNTRY=5        # 每国测试的镜像数
+OPT_NEIGHBORS=false      # 放宽到邻近国家
+OPT_CN=false             # 同时更新 archlinuxcn 镜像列表
+OPT_BACKEND="auto"       # auto / rate-mirrors / reflector
+OPT_DRYRUN=false         # 只预览，不写入
+OPT_YES=false            # 跳过交互确认
+OPT_FALLBACK=true        # 末尾追加 CERNET 联合镜像站保底
+
+# ---------- 本地化 ----------
+ORIGINAL_LANG="${LC_ALL:-${LC_MESSAGES:-${LANG:-}}}"
+case "$ORIGINAL_LANG" in
+    *zh*) UI_LANG="zh" ;;
+    *)    UI_LANG="en" ;;
+esac
+
+declare -A M_ZH=(
+    [title]="Arch Linux 镜像源更新器"
+    [opt_title]="选项："
+    [help_cc]="手动指定国家/地区 ISO 代码（如 CN、JP、US）"
+    [help_mirrors]="写入镜像列表的服务器数量（默认 10）"
+    [help_delay]="镜像最大同步延迟秒数（默认 43200 = 12 小时）"
+    [help_proto]="测速使用的协议：https | http | both（默认 https）"
+    [help_conc]="并发测速数（默认 16）"
+    [help_per_country]="每个国家测速的镜像数量（默认 5）"
+    [help_neighbors]="放宽范围：同时考虑地理位置邻近的国家/地区"
+    [help_cn]="同时更新 archlinuxcn 镜像列表"
+    [help_backend]="后端：auto | rate-mirrors | reflector（默认 auto）"
+    [help_dryrun]="预览模式：只测速并打印结果，不写入任何文件"
+    [help_yes]="跳过交互确认（用于脚本/定时任务）"
+    [help_no_fallback]="不在末尾追加 CERNET 联合镜像站保底"
+    [fallback_note]="保底镜像（CERNET 联合镜像站，自动跳转到最近可用镜像）"
+    [help_help]="显示本帮助"
+    [ex_title]="示例："
+    [ex_auto]="# 自动检测地区并更新"
+    [ex_force]="# 强制使用日本镜像"
+    [ex_cn]="# 顺带更新 archlinuxcn 镜像列表"
+    [detecting]="正在检测所在地区..."
+    [detected]="检测到地区"
+    [detected_ip]="时区无法判断，通过 IP 定位得到地区"
+    [confirm_region]="使用该地区吗? [Y/n]: "
+    [ask_cc]="请输入国家/地区 ISO 代码（如 CN、JP、US）: "
+    [using_region]="目标地区"
+    [global_mode]="未指定地区，将在全球范围内选择最快镜像"
+    [no_tool]="未找到 rate-mirrors 或 reflector，请先安装: sudo pacman -S rate-mirrors"
+    [need_sudo]="请求管理员权限..."
+    [backup_saved]="备份已保存至"
+    [running]="正在测速，通常需要 20~60 秒，请耐心等待..."
+    [cmd_preview]="执行命令"
+    [result_title]="测速完成，镜像列表如下"
+    [written]="已更新"
+    [dry_run]="预览模式：未写入任何文件"
+    [empty_result]="测速未产生有效结果"
+    [invalid_result]="生成的内容不是有效的镜像列表，已放弃写入"
+    [cancelled]="操作已取消"
+    [rollback]="执行失败或被中断，正在回滚..."
+    [restored]="已恢复"
+    [removed_new]="已删除新建文件"
+    [rollback_fail]="回滚失败！请手动恢复"
+    [final_backup]="备份文件位置"
+    [suggest]="建议执行: sudo pacman -Syyu"
+    [cn_updated]="archlinuxcn 镜像列表已更新"
+    [cn_failed]="archlinuxcn 镜像测速失败，已跳过"
+    [cn_hint1]="注意: /etc/pacman.conf 的 [archlinuxcn] 段尚未引用该文件"
+    [cn_hint2]="可将其中的 Server = 行替换为: Include = /etc/pacman.d/archlinuxcn-mirrorlist"
+    [err_unknown_opt]="未知选项"
+    [err_need_arg]="选项缺少参数"
+    [err_bad_int]="需要一个非负整数"
+    [err_bad_cc]="无法识别的国家/地区"
+    [err_bad_proto]="协议只能是 https、http 或 both"
+    [err_bad_backend]="后端只能是 auto、rate-mirrors 或 reflector"
+    [err_no_write]="写入失败"
+)
+
+declare -A M_EN=(
+    [title]="Arch Linux mirror updater"
+    [opt_title]="Options:"
+    [help_cc]="Set country/region ISO code manually (e.g. CN, JP, US)"
+    [help_mirrors]="Number of servers to write into the mirrorlist (default 10)"
+    [help_delay]="Max mirror sync delay in seconds (default 43200 = 12h)"
+    [help_proto]="Protocol used for speed test: https | http | both (default https)"
+    [help_conc]="Number of simultaneous speed tests (default 16)"
+    [help_per_country]="Number of mirrors to test per country (default 5)"
+    [help_neighbors]="Widen the search to geographically close countries"
+    [help_cn]="Also update the archlinuxcn mirror list"
+    [help_backend]="Backend: auto | rate-mirrors | reflector (default auto)"
+    [help_dryrun]="Preview only: rank mirrors and print, write nothing"
+    [help_yes]="Skip interactive confirmation (for scripts/cron)"
+    [help_no_fallback]="Do not append the CERNET last-resort mirror"
+    [fallback_note]="last-resort mirror (CERNET, auto-redirects to the nearest one)"
+    [help_help]="Show this help"
+    [ex_title]="Examples:"
+    [ex_auto]="# Auto detect region and update"
+    [ex_force]="# Force Japanese mirrors"
+    [ex_cn]="# Also update the archlinuxcn mirror list"
+    [detecting]="Detecting location..."
+    [detected]="Detected region"
+    [detected_ip]="Timezone unknown, resolved via IP geolocation"
+    [confirm_region]="Use this region? [Y/n]: "
+    [ask_cc]="Enter country/region ISO code (e.g. CN, JP, US): "
+    [using_region]="Target region"
+    [global_mode]="No region set, picking the fastest mirrors worldwide"
+    [no_tool]="Neither rate-mirrors nor reflector found. Install: sudo pacman -S rate-mirrors"
+    [need_sudo]="Requesting sudo privileges..."
+    [backup_saved]="Backup saved to"
+    [running]="Ranking mirrors, this usually takes 20~60 seconds..."
+    [cmd_preview]="Running"
+    [result_title]="Ranking finished, resulting mirror list"
+    [written]="Updated"
+    [dry_run]="Dry run: nothing was written"
+    [empty_result]="Speed test produced no result"
+    [invalid_result]="Generated content is not a valid mirror list, aborting"
+    [cancelled]="Cancelled"
+    [rollback]="Failed or interrupted, rolling back..."
+    [restored]="Restored"
+    [removed_new]="Removed newly created file"
+    [rollback_fail]="Rollback failed! Please restore manually"
+    [final_backup]="Backup file location"
+    [suggest]="Suggested: sudo pacman -Syyu"
+    [cn_updated]="archlinuxcn mirror list updated"
+    [cn_failed]="archlinuxcn ranking failed, skipped"
+    [cn_hint1]="Note: the [archlinuxcn] section of /etc/pacman.conf does not include this file yet"
+    [cn_hint2]="Replace its Server = lines with: Include = /etc/pacman.d/archlinuxcn-mirrorlist"
+    [err_unknown_opt]="Unknown option"
+    [err_need_arg]="Option requires an argument"
+    [err_bad_int]="requires a non-negative integer"
+    [err_bad_cc]="Unrecognized country/region"
+    [err_bad_proto]="Protocol must be https, http or both"
+    [err_bad_backend]="Backend must be auto, rate-mirrors or reflector"
+    [err_no_write]="Write failed"
+)
+
+# 取本地化字符串
+msg() {
+    local key="$1"
+    if [[ "$UI_LANG" == "zh" ]]; then
+        printf '%s' "${M_ZH[$key]:-?$key?}"
+    else
+        printf '%s' "${M_EN[$key]:-?$key?}"
+    fi
+}
+
+# ---------- 输出样式 ----------
+readonly C_RED=$'\033[1;31m' C_GREEN=$'\033[1;32m' C_YELLOW=$'\033[1;33m'
+readonly C_BLUE=$'\033[1;34m' C_CYAN=$'\033[1;36m' C_DIM=$'\033[2m' C_NC=$'\033[0m'
+
+info()  { printf '%s[INFO]%s %s\n' "$C_BLUE" "$C_NC" "$*"; }
+ok()    { printf '%s[ OK ]%s %s\n' "$C_GREEN" "$C_NC" "$*"; }
+warn()  { printf '%s[WARN]%s %s\n' "$C_YELLOW" "$C_NC" "$*"; }
+err()   { printf '%s[FAIL]%s %s\n' "$C_RED" "$C_NC" "$*" >&2; }
+die()   { err "$*"; exit 1; }
+
+have() { command -v "$1" >/dev/null 2>&1; }
+
+# ---------- 回滚/清理机制 ----------
+declare -a RB_TARGETS=() RB_BACKUPS=() RB_STATE=()   # 状态: yes(原本存在) / no(原本不存在) / unknown(备份失败)
+declare -a TMP_FILES=()
+SCRIPT_OK=false
+
+# 创建临时文件并登记（退出时统一删除）
+new_tmp() {
+    local f
+    f="$(mktemp "$CACHE_DIR/$1.XXXXXX")" || die "mktemp failed in $CACHE_DIR"
+    TMP_FILES+=("$f")
+    printf '%s' "$f"
+}
+
+clean_tmp() {
+    local f
+    for f in "${TMP_FILES[@]:-}"; do
+        [[ -n "$f" ]] && rm -f -- "$f"
+    done
+}
+
+register_target() {
+    local target="$1" bak
+    if [[ -f "$target" ]]; then
+        bak="$CACHE_DIR/$(basename "$target").$STAMP.bak"
+        if sudo cp -p -- "$target" "$bak" 2>/dev/null; then
+            sudo chown "$(id -u):$(id -g)" "$bak" 2>/dev/null || true
+            RB_TARGETS+=("$target"); RB_BACKUPS+=("$bak"); RB_STATE+=("yes")
+            ok "$(msg backup_saved) ${C_DIM}$bak${C_NC}"
+            ln -sfn "$(basename "$bak")" "$CACHE_DIR/$(basename "$target").latest.bak" 2>/dev/null || true
+            prune_backups "$(basename "$target")"
+        else
+            RB_TARGETS+=("$target"); RB_BACKUPS+=(""); RB_STATE+=("unknown")
+            warn "backup failed: $target"
+        fi
+    else
+        RB_TARGETS+=("$target"); RB_BACKUPS+=(""); RB_STATE+=("no")
+    fi
+}
+
+prune_backups() {
+    local base="$1"
+    # 备份均为用户属主，可直接删除；保留最近 KEEP_BACKUPS 份
+    ls -1t "$CACHE_DIR/$base".*.bak 2>/dev/null | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
+}
+
+cleanup() {
+    local code=$? i
+    trap - EXIT INT TERM HUP
+    if [[ "$SCRIPT_OK" != true && ${#RB_TARGETS[@]} -gt 0 ]]; then
+        printf '\n'
+        warn "$(msg rollback)"
+        for i in "${!RB_TARGETS[@]}"; do
+            case "${RB_STATE[$i]}" in
+                yes)
+                    if sudo cp -p -- "${RB_BACKUPS[$i]}" "${RB_TARGETS[$i]}"; then
+                        ok "$(msg restored) ${RB_TARGETS[$i]}"
+                    else
+                        err "$(msg rollback_fail) ${RB_TARGETS[$i]}"
+                    fi
+                    ;;
+                no)
+                    sudo rm -f -- "${RB_TARGETS[$i]}" && ok "$(msg removed_new) ${RB_TARGETS[$i]}"
+                    ;;
+                *) : ;;   # 备份失败，保持原样不动
+            esac
+        done
+    fi
+    clean_tmp
+    exit "$code"
+}
+
+# ---------- 帮助 ----------
+usage() {
+    if [[ "$UI_LANG" == "zh" ]]; then
+        cat <<EOF
+${C_CYAN}$(msg title)${C_NC} (upmirror $VERSION)
+
+用法: $PROG [选项]
+
+$(msg opt_title)
+  -c, --country <CC>       $(msg help_cc)
+  -n, --mirrors <N>        $(msg help_mirrors)
+      --max-delay <SEC>    $(msg help_delay)
+      --protocol <P>       $(msg help_proto)
+      --concurrency <N>    $(msg help_conc)
+      --per-country <N>    $(msg help_per_country)
+      --neighbors          $(msg help_neighbors)
+      --cn                 $(msg help_cn)
+      --backend <B>        $(msg help_backend)
+      --dry-run            $(msg help_dryrun)
+      --no-fallback        $(msg help_no_fallback)
+  -y, --yes                $(msg help_yes)
+  -h, --help               $(msg help_help)
+  -V, --version            显示版本号
+
+$(msg ex_title)
+  $PROG                          $(msg ex_auto)
+  $PROG -c JP                    $(msg ex_force)
+  $PROG --cn --neighbors         $(msg ex_cn)
+EOF
+    else
+        cat <<EOF
+${C_CYAN}$(msg title)${C_NC} (upmirror $VERSION)
+
+Usage: $PROG [options]
+
+$(msg opt_title)
+  -c, --country <CC>       $(msg help_cc)
+  -n, --mirrors <N>        $(msg help_mirrors)
+      --max-delay <SEC>    $(msg help_delay)
+      --protocol <P>       $(msg help_proto)
+      --concurrency <N>    $(msg help_conc)
+      --per-country <N>    $(msg help_per_country)
+      --neighbors          $(msg help_neighbors)
+      --cn                 $(msg help_cn)
+      --backend <B>        $(msg help_backend)
+      --dry-run            $(msg help_dryrun)
+      --no-fallback        $(msg help_no_fallback)
+  -y, --yes                $(msg help_yes)
+  -h, --help               $(msg help_help)
+  -V, --version            Show version
+
+$(msg ex_title)
+  $PROG                          $(msg ex_auto)
+  $PROG -c JP                    $(msg ex_force)
+  $PROG --cn --neighbors         $(msg ex_cn)
+EOF
+    fi
+}
+
+# ---------- 参数解析 ----------
+need_int() {   # $1=选项名 $2=值
+    [[ "${2:-}" =~ ^[0-9]+$ ]] || die "$1 $(msg err_bad_int)"
+}
+
+parse_args() {
+    while [[ $# -gt 0 ]]; do
+        case "$1" in
+            -h|--help)       usage; exit 0 ;;
+            -V|--version)    printf 'upmirror %s\n' "$VERSION"; exit 0 ;;
+            -c|--country)    shift; OPT_CC="${1:-}"; [[ -n "$OPT_CC" ]] || die "--country $(msg err_need_arg)" ;;
+            -n|--mirrors)    shift; need_int "--mirrors" "${1:-}"; OPT_MIRRORS="$1" ;;
+            --max-delay)     shift; need_int "--max-delay" "${1:-}"; OPT_MAX_DELAY="$1" ;;
+            --protocol)      shift; OPT_PROTOCOL="${1:-}" ;;
+            --concurrency)   shift; need_int "--concurrency" "${1:-}"; OPT_CONCURRENCY="$1" ;;
+            --per-country)   shift; need_int "--per-country" "${1:-}"; OPT_PER_COUNTRY="$1" ;;
+            --neighbors)     OPT_NEIGHBORS=true ;;
+            --cn)            OPT_CN=true ;;
+            --backend)       shift; OPT_BACKEND="${1:-}" ;;
+            --dry-run)       OPT_DRYRUN=true; SCRIPT_OK=true ;;   # 不写文件，无需回滚
+            -y|--yes)        OPT_YES=true ;;
+            --no-fallback)   OPT_FALLBACK=false ;;
+            --)              shift; break ;;
+            *)               die "$(msg err_unknown_opt): $1" ;;
+        esac
+        shift
+    done
+
+    case "$OPT_PROTOCOL" in
+        https|http|both) ;;
+        *) die "$(msg err_bad_proto)" ;;
+    esac
+    case "$OPT_BACKEND" in
+        auto|rate-mirrors|reflector) ;;
+        *) die "$(msg err_bad_backend)" ;;
+    esac
+    (( OPT_MIRRORS > 0 )) || die "--mirrors $(msg err_bad_int)"
+}
+
+# ---------- 地区识别 ----------
+detect_cc_by_tz() {
+    local tz=""
+    if have timedatectl; then
+        tz="$(timedatectl show -p Timezone --value 2>/dev/null)"
+    fi
+    if [[ -z "$tz" && -e /etc/localtime ]]; then
+        tz="$(readlink -f /etc/localtime 2>/dev/null | sed 's#.*/zoneinfo/##')"
+    fi
+    case "$tz" in
+        Asia/Shanghai|Asia/Chongqing|Asia/Urumqi|Asia/Harbin|Asia/Beijing|PRC) echo CN ;;
+        Asia/Hong_Kong)        echo HK ;;
+        Asia/Taipei)           echo TW ;;
+        Asia/Tokyo|Asia/Osaka) echo JP ;;
+        Asia/Seoul)            echo KR ;;
+        Asia/Singapore)        echo SG ;;
+        Asia/Kolkata|Asia/Calcutta) echo IN ;;
+        Asia/Bangkok)          echo TH ;;
+        Asia/Ho_Chi_Minh|Asia/Saigon) echo VN ;;
+        Asia/Kuala_Lumpur)     echo MY ;;
+        Asia/Jakarta)          echo ID ;;
+        Asia/Manila)           echo PH ;;
+        Asia/Dubai)            echo AE ;;
+        Europe/London)         echo GB ;;
+        Europe/Berlin|Europe/Frankfurt) echo DE ;;
+        Europe/Paris)          echo FR ;;
+        Europe/Amsterdam)      echo NL ;;
+        Europe/Moscow)         echo RU ;;
+        Australia/Sydney|Australia/Melbourne|Australia/Brisbane|Australia/Perth) echo AU ;;
+        America/New_York|America/Chicago|America/Denver|America/Los_Angeles|America/Phoenix) echo US ;;
+        America/Toronto|America/Vancouver) echo CA ;;
+        America/Sao_Paulo)     echo BR ;;
+        *) echo "" ;;
+    esac
+}
+
+detect_cc_by_ip() {
+    local cc=""
+    have curl || return 0
+    cc="$(curl -fsS --max-time 3 https://ipapi.co/country 2>/dev/null | tr -d '[:space:]')"
+    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] && printf '%s' "${cc^^}"
+}
+
+# 名称/代码 → 2 位代码（全名需 reflector 的国家表）
+normalize_cc() {
+    local v="$1"
+    if [[ "$v" =~ ^[A-Za-z]{2}$ ]]; then
+        printf '%s' "${v^^}"; return 0
+    fi
+    if have reflector; then
+        local code
+        code="$(reflector --list-countries 2>/dev/null | awk -v want="${v,,}" '
+            { if (match($0, /[ \t][A-Z][A-Z][ \t]+[0-9]+[ \t]*$/)) {
+                  name = substr($0, 1, RSTART-1); gsub(/[ \t]+$/, "", name)
+                  if (tolower(name) == want) { print substr($0, RSTART+1, 2); exit } } }')"
+        [[ -n "$code" ]] && { printf '%s' "$code"; return 0; }
+    fi
+    return 1
+}
+
+# 代码 → reflector 用的国家全名
+cc_to_name() {
+    have reflector || return 1
+    reflector --list-countries 2>/dev/null | awk -v want="${1^^}" '
+        { if (match($0, /[ \t][A-Z][A-Z][ \t]+[0-9]+[ \t]*$/)) {
+              if (substr($0, RSTART+1, 2) == want) {
+                  name = substr($0, 1, RSTART-1); gsub(/[ \t]+$/, "", name); print name; exit } } }'
+}
+
+# 邻近国家/地区（只用于 --neighbors 放宽范围）
+neighbor_codes() {
+    case "$1" in
+        CN) echo "CN,HK,TW,JP,KR,SG" ;;
+        HK) echo "HK,CN,TW,JP,SG" ;;
+        TW) echo "TW,JP,HK,CN,SG" ;;
+        JP) echo "JP,KR,TW,HK,CN" ;;
+        KR) echo "KR,JP,CN,TW" ;;
+        SG) echo "SG,MY,ID,TH,VN,CN" ;;
+        MY) echo "MY,SG,ID,TH,VN" ;;
+        US) echo "US,CA" ;;
+        CA) echo "CA,US" ;;
+        GB|DE|FR|NL|BE) echo "DE,FR,NL,GB,BE" ;;
+        AU) echo "AU,NZ,SG" ;;
+        RU) echo "RU,DE,NL,FI" ;;
+        IN) echo "IN,SG,AE" ;;
+        BR) echo "BR,US" ;;
+        *)  echo "$1" ;;
+    esac
+}
+
+# ---------- 后端 ----------
+pick_backend() {
+    case "$OPT_BACKEND" in
+        rate-mirrors)
+            have rate-mirrors || die "$(msg no_tool)"
+            echo rate-mirrors ;;
+        reflector)
+            have reflector || die "$(msg no_tool)"
+            echo reflector ;;
+        auto)
+            if have rate-mirrors; then echo rate-mirrors
+            elif have reflector; then echo reflector
+            else die "$(msg no_tool)"
+            fi ;;
+    esac
+}
+
+# 生成镜像列表到 $1；成功返回 0
+generate_list() {
+    local out="$1" backend="$2" cc="$3" filter="$4"
+    local -a cmd=()
+
+    case "$backend" in
+        rate-mirrors)
+            cmd=(rate-mirrors
+                 --concurrency="$OPT_CONCURRENCY"
+                 --entry-country="${cc:-US}"
+                 --country-test-mirrors-per-country="$OPT_PER_COUNTRY"
+                 --max-mirrors-to-output="$OPT_MIRRORS"
+                 --disable-comments-in-file
+                 --save="$out")
+            case "$OPT_PROTOCOL" in
+                https) cmd+=(--protocol=https) ;;
+                http)  cmd+=(--protocol=http) ;;
+                both)  cmd+=(--protocol=http --protocol=https) ;;
+            esac
+            [[ -n "$filter" ]] && cmd+=(--include-countries="$filter")
+            cmd+=(arch --max-delay="$OPT_MAX_DELAY")
+            ;;
+        reflector)
+            local name age_h
+            name="$(cc_to_name "$cc")"
+            [[ -n "$name" ]] || return 1
+            age_h=$(( OPT_MAX_DELAY / 3600 )); (( age_h < 1 )) && age_h=1
+            local proto="https"
+            case "$OPT_PROTOCOL" in
+                both) proto="http,https" ;;
+                *)    proto="$OPT_PROTOCOL" ;;
+            esac
+            cmd=(reflector --sort rate --verbose --download-timeout 5
+                 --protocol "$proto"
+                 --age "$age_h" --fastest "$OPT_MIRRORS"
+                 --country "$name")
+            ;;
+        *) return 1 ;;
+    esac
+
+    info "$(msg cmd_preview): ${C_DIM}${cmd[*]}${C_NC}"
+    if [[ "$backend" == "reflector" ]]; then
+        # reflector 的日志可能混入 stdout，只保留注释与 Server 行
+        "${cmd[@]}" 2>/dev/null | grep -E '^(#|Server[[:space:]]*=)' > "$out"
+        return "${PIPESTATUS[0]}"
+    fi
+    "${cmd[@]}"
+}
+
+# 校验：非空、至少一行 Server =
+validate_list() {
+    local f="$1" n
+    [[ -s "$f" ]] || return 1
+    n="$(grep -cE '^[[:space:]]*Server[[:space:]]*=' "$f")"
+    [[ "$n" -gt 0 ]] || return 1
+    return 0
+}
+
+# 生成带头部注释的最终文件；$6 为保底镜像地址（可为空）
+compose_list() {
+    local src="$1" dst="$2" backend="$3" cc="$4" filter="$5" fallback="${6:-}"
+    {
+        printf '##\n'
+        printf '## Arch Linux repository mirrorlist\n'
+        printf '##\n'
+        printf '## Generated by upmirror %s on %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
+        printf '## Backend: %s | protocol=%s | max-delay=%ss | mirrors=%s\n' \
+               "$backend" "$OPT_PROTOCOL" "$OPT_MAX_DELAY" "$OPT_MIRRORS"
+        printf '## Region: %s\n' "${cc:-auto/global}${filter:+ (candidates: $filter)}"
+        printf '##\n\n'
+        cat "$src"
+        if [[ -n "$fallback" && "$OPT_FALLBACK" == true ]]; then
+            printf '\n## %s\n' "$(msg fallback_note)"
+            printf 'Server = %s\n' "$fallback"
+        fi
+    } > "$dst"
+}
+
+# 原子替换
+install_atomic() {
+    local src="$1" dst="$2" tmp="$dst.upmirror.new"
+    sudo cp -- "$src" "$tmp" \
+        && sudo chmod 0644 "$tmp" \
+        && sudo chown root:root "$tmp" \
+        && sudo mv -f -- "$tmp" "$dst"
+}
+
+# ---------- 主流程 ----------
+main() {
+    parse_args "$@"
+
+    printf '\n%s=== %s ===%s\n' "$C_CYAN" "$(msg title)" "$C_NC"
+
+    # 1. 后端
+    local backend; backend="$(pick_backend)"
+
+    # 2. 确定地区
+    local cc="" detect_source=""
+    if [[ -n "$OPT_CC" ]]; then
+        cc="$(normalize_cc "$OPT_CC")" || die "$(msg err_bad_cc): $OPT_CC"
+    else
+        info "$(msg detecting)"
+        cc="$(detect_cc_by_tz)"
+        if [[ -z "$cc" ]]; then
+            cc="$(detect_cc_by_ip)"
+            [[ -n "$cc" ]] && detect_source="$cc"
+        fi
+        if [[ -z "$cc" ]]; then
+            warn "$(msg global_mode)"
+        elif [[ "$OPT_YES" != true && -t 0 ]]; then
+            printf '%s%s%s: %s%s%s. %s' \
+                   "$C_YELLOW" "$(msg detected)" "$C_NC" \
+                   "$C_CYAN" "$cc" "$C_NC" "$(msg confirm_region)"
+            local ans; read -r ans
+            if [[ ! "${ans:-Y}" =~ ^[Yy] ]]; then
+                printf '%s' "$(msg ask_cc)"
+                read -r ans
+                [[ -n "$ans" ]] || die "$(msg cancelled)"
+                cc="$(normalize_cc "$ans")" || die "$(msg err_bad_cc): $ans"
+            fi
+        fi
+    fi
+
+    # 3. 候选范围
+    local filter=""
+    if [[ -n "$cc" ]]; then
+        info "$(msg using_region): ${C_GREEN}${cc}${C_NC}"
+        if [[ "$OPT_NEIGHBORS" == true ]]; then
+            filter="$(neighbor_codes "$cc")"
+        else
+            filter="$cc"
+        fi
+    fi
+
+    # 4. 初始化
+    mkdir -p "$CACHE_DIR" 2>/dev/null || die "cannot create $CACHE_DIR"
+    # 单一 trap：负责临时文件清理 + 失败的镜像列表回滚
+    trap cleanup EXIT INT TERM HUP
+    local tmp_list tmp_cn; tmp_list="$(new_tmp list)"
+
+    # 5. 测速生成
+    info "$(msg running)"
+    if ! generate_list "$tmp_list" "$backend" "$cc" "$filter" || ! validate_list "$tmp_list"; then
+        [[ -s "$tmp_list" ]] || warn "$(msg empty_result)"
+        die "$(msg invalid_result)"
+    fi
+
+    # 6. 组装最终内容（头部注释 + 镜像 + 保底）
+    local final; final="$(new_tmp final)"
+    compose_list "$tmp_list" "$final" "$backend" "$cc" "$filter" "$FALLBACK_MIRROR"
+
+    printf '\n%s%s%s\n' "$C_CYAN" "$(msg result_title)" "$C_NC"
+    grep -E '^[[:space:]]*Server[[:space:]]*=' "$final" | nl -ba -w2 -s'. ' || true
+
+    # 7. 预览模式直接结束
+    if [[ "$OPT_DRYRUN" == true ]]; then
+        printf '\n'
+        ok "$(msg dry_run)"
+        printf '%s\n' "$(msg suggest)"
+        return 0
+    fi
+
+    # 8. 备份 + 注册回滚
+    info "$(msg need_sudo)"
+    sudo -v || die "$(msg need_sudo)"
+    register_target "$TARGET_MIRRORLIST"
+
+    # 9. 原子写入
+    if ! install_atomic "$final" "$TARGET_MIRRORLIST"; then
+        die "$(msg err_no_write): $TARGET_MIRRORLIST"
+    fi
+    ok "$(msg written) ${C_GREEN}$TARGET_MIRRORLIST${C_NC}"
+
+    # 10. 可选：archlinuxcn
+    if [[ "$OPT_CN" == true ]]; then
+        tmp_cn="$(new_tmp cn)"
+        if rate-mirrors --concurrency="$OPT_CONCURRENCY" \
+                        --max-mirrors-to-output="$OPT_MIRRORS" \
+                        --disable-comments-in-file \
+                        --save="$tmp_cn" archlinuxcn 2>/dev/null \
+           && validate_list "$tmp_cn"; then
+            register_target "$TARGET_CN_MIRRORLIST"
+            local final_cn; final_cn="$(new_tmp cnfinal)"
+            compose_list "$tmp_cn" "$final_cn" "rate-mirrors" "archlinuxcn" "$filter" "$FALLBACK_CN_MIRROR"
+            if install_atomic "$final_cn" "$TARGET_CN_MIRRORLIST"; then
+                ok "$(msg cn_updated) ${C_GREEN}$TARGET_CN_MIRRORLIST${C_NC}"
+                if ! awk '/^\[archlinuxcn\]/{f=1;next} /^\[/{f=0} f' "$PACMAN_CONF" 2>/dev/null \
+                     | grep -qE '^[[:space:]]*Include[[:space:]]*='; then
+                    printf '\n'
+                    warn "$(msg cn_hint1)"
+                    printf '        %s\n' "$(msg cn_hint2)"
+                fi
+            fi
+        else
+            warn "$(msg cn_failed)"
+        fi
+    fi
+
+    printf '\n'
+    ok "$(msg final_backup): ${C_DIM}$CACHE_DIR${C_NC}"
+    printf '%s\n' "$(msg suggest)"
+
+    SCRIPT_OK=true
+    return 0
+}
+
+main "$@"
