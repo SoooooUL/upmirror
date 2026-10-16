@@ -148,15 +148,26 @@ else
     check "保底镜像位于列表末尾" 1
 fi
 
-# --- 6. 列表校验 ---
-printf '\n[6] 写入前校验\n'
+# --- 6. sysup 兼容性：reflector 的 "# When:" 时效标记 ---
+printf '\n[6] sysup 兼容的时效标记\n'
+# 直接照抄 sysup 的解析逻辑
+when_str="$(sed -n 's/^# When:[[:space:]]*//p;T;q' "$SANDBOX/out5" 2>/dev/null || true)"
+if [[ -n "$when_str" ]] && file_ts="$(date -u -d "${when_str% UTC}" +%s 2>/dev/null)"; then
+    days_old=$((( $(date +%s) - file_ts ) / 86400))
+    check "sysup 能解析时效标记（当前 ${days_old} 天）" "$([[ $days_old -eq 0 ]] && echo 0 || echo 1)"
+else
+    check "sysup 能解析时效标记（实际解析到: '${when_str}'）" 1
+fi
+
+# --- 7. 列表校验 ---
+printf '\n[7] 写入前校验\n'
 : > "$SANDBOX/empty"; validate_list "$SANDBOX/empty"; check "拒绝空文件" "$([[ $? != 0 ]] && echo 0 || echo 1)"
 printf 'this is not a mirrorlist\n' > "$SANDBOX/junk"; validate_list "$SANDBOX/junk"
 check "拒绝无 Server 行的内容" "$([[ $? != 0 ]] && echo 0 || echo 1)"
 validate_list "$SANDBOX/src5"; check "接受正常列表" $?
 
-# --- 7. 地区识别与邻近区域 ---
-printf '\n[7] 地区识别 / 邻近区域\n'
+# --- 8. 地区识别与邻近区域 ---
+printf '\n[8] 地区识别 / 邻近区域\n'
 check "normalize_cc: 小写代码 -> 大写" \
       "$([[ "$(normalize_cc cn)" == CN ]] && echo 0 || echo 1)"
 check "normalize_cc: 国家全名 -> 代码" \

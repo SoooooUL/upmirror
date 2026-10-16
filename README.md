@@ -127,6 +127,37 @@ bash tests/smoke.sh
   否则会因 pacman 自身的下载沙箱（`sandboxuser: alpm`）报“无法获取某些文件”，
   与镜像无关；正常 `sudo pacman -Syu` 不受影响。
 
+## 接入 sysup（shorin-contrib）
+
+sysup 的镜像更新步骤有两个硬约定，upmirror 都已兼容：
+
+| sysup 的行为 | upmirror 的配合 |
+|---|---|
+| `find_mirror_script()` 只认 `mirror-update` 这个名字 | 仓库提供 `contrib/mirror-update` 入口脚本 |
+| 用 `sed -n 's/^# When:...//p'` 解析 mirrorlist 时效，解析不到就直接跳过 | 生成的文件带有 reflector 格式的 `# When: YYYY-MM-DD HH:MM:SS UTC` 行 |
+
+安装（只改用户目录里的软链，不动包管理的文件）：
+
+```bash
+ln -sf ~/Projects/upmirror/contrib/mirror-update ~/.local/bin/mirror-update
+```
+
+入口脚本实际执行 `upmirror -y -q`：免交互确认，测速输出写进
+`~/.cache/upmirror/last-run.log`，不糊满 sysup 的输出。
+原脚本仍在 `/usr/lib/shorin-contrib/mirror-update`，可显式调用；想恢复原状：
+
+```bash
+ln -sf /usr/lib/shorin-contrib/mirror-update ~/.local/bin/mirror-update
+```
+
+注意事项：
+
+- sysup 只在镜像源超过 `MIRROR_MAX_DAYS`（默认 30 天）时才更新镜像，
+  该常量在 `/usr/lib/shorin-contrib/sysup` 里；想让每次 sysup 都刷新可改成 0，
+  但该文件属于 shorin-contrib 包，改动会被包更新覆盖。
+- sysup 的镜像步骤只更新 Arch 主仓库的 mirrorlist；archlinuxcn 需要另行
+  `upmirror --cn`。
+
 ## 定时任务示例
 
 ```bash

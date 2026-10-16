@@ -26,6 +26,7 @@ TARGET_CN_MIRRORLIST="/etc/pacman.d/archlinuxcn-mirrorlist"
 PACMAN_CONF="/etc/pacman.conf"
 CACHE_DIR="${XDG_CACHE_HOME:-$HOME/.cache}/upmirror"
 STAMP="$(date +%Y%m%d-%H%M%S)"
+LOG_FILE=""              # 安静模式下的测速日志路径（main 里赋值）
 KEEP_BACKUPS=10          # 每个目标文件保留的备份份数
 
 # ---------- 保底镜像 ----------
@@ -47,6 +48,7 @@ OPT_CN=false             # 同时更新 archlinuxcn 镜像列表
 OPT_BACKEND="auto"       # auto / rate-mirrors / reflector
 OPT_DRYRUN=false         # 只预览，不写入
 OPT_YES=false            # 跳过交互确认
+OPT_QUIET=false          # 安静模式：测速输出进日志文件
 OPT_FALLBACK=true        # 末尾追加 CERNET 联合镜像站保底
 
 # ---------- 本地化 ----------
@@ -70,6 +72,8 @@ declare -A M_ZH=(
     [help_backend]="后端：auto | rate-mirrors | reflector（默认 auto）"
     [help_dryrun]="预览模式：只测速并打印结果，不写入任何文件"
     [help_yes]="跳过交互确认（用于脚本/定时任务）"
+    [help_quiet]="安静模式：测速输出写入日志文件而非终端"
+    [quiet_log]="测速完整日志"
     [help_no_fallback]="不在末尾追加 CERNET 联合镜像站保底"
     [fallback_note]="保底镜像（CERNET 联合镜像站，自动跳转到最近可用镜像）"
     [help_help]="显示本帮助"
@@ -128,6 +132,8 @@ declare -A M_EN=(
     [help_backend]="Backend: auto | rate-mirrors | reflector (default auto)"
     [help_dryrun]="Preview only: rank mirrors and print, write nothing"
     [help_yes]="Skip interactive confirmation (for scripts/cron)"
+    [help_quiet]="Quiet mode: write ranking output to a log file instead of the terminal"
+    [quiet_log]="Full ranking log"
     [help_no_fallback]="Do not append the CERNET last-resort mirror"
     [fallback_note]="last-resort mirror (CERNET, auto-redirects to the nearest one)"
     [help_help]="Show this help"
@@ -287,6 +293,7 @@ $(msg opt_title)
       --dry-run            $(msg help_dryrun)
       --no-fallback        $(msg help_no_fallback)
   -y, --yes                $(msg help_yes)
+  -q, --quiet              $(msg help_quiet)
   -h, --help               $(msg help_help)
   -V, --version            显示版本号
 
@@ -314,6 +321,7 @@ $(msg opt_title)
       --dry-run            $(msg help_dryrun)
       --no-fallback        $(msg help_no_fallback)
   -y, --yes                $(msg help_yes)
+  -q, --quiet              $(msg help_quiet)
   -h, --help               $(msg help_help)
   -V, --version            Show version
 
@@ -346,6 +354,7 @@ parse_args() {
             --backend)       shift; OPT_BACKEND="${1:-}" ;;
             --dry-run)       OPT_DRYRUN=true; SCRIPT_OK=true ;;   # 不写文件，无需回滚
             -y|--yes)        OPT_YES=true ;;
+            -q|--quiet)      OPT_QUIET=true ;;
             --no-fallback)   OPT_FALLBACK=false ;;
             --)              shift; break ;;
             *)               die "$(msg err_unknown_opt): $1" ;;
@@ -471,6 +480,18 @@ pick_backend() {
     esac
 }
 
+# 实际执行后端命令；$1=backend $2=out $3..=命令
+# 单独抽出成函数，便于安静模式下统一把输出重定向到日志
+run_backend() {
+    local backend="$1" out="$2"; shift 2
+    if [[ "$backend" == "reflector" ]]; then
+        # reflector 的日志可能混入 stdout，只保留注释与 Server 行
+        "$@" 2>/dev/null | grep -E '^(#|Server[[:space:]]*=)' > "$out"
+        return "${PIPESTATUS[0]}"
+    fi
+    "$@"
+}
+
 # 生成镜像列表到 $1；成功返回 0
 generate_list() {
     local out="$1" backend="$2" cc="$3" filter="$4"
@@ -512,12 +533,12 @@ generate_list() {
     esac
 
     info "$(msg cmd_preview): ${C_DIM}${cmd[*]}${C_NC}"
-    if [[ "$backend" == "reflector" ]]; then
-        # reflector 的日志可能混入 stdout，只保留注释与 Server 行
-        "${cmd[@]}" 2>/dev/null | grep -E '^(#|Server[[:space:]]*=)' > "$out"
-        return "${PIPESTATUS[0]}"
+    if [[ "$OPT_QUIET" == true ]]; then
+        info "$(msg quiet_log): ${C_DIM}${LOG_FILE}${C_NC}"
+        run_backend "$backend" "$out" "${cmd[@]}" >>"$LOG_FILE" 2>&1
+    else
+        run_backend "$backend" "$out" "${cmd[@]}"
     fi
-    "${cmd[@]}"
 }
 
 # 校验：非空、至少一行 Server =
@@ -541,6 +562,9 @@ compose_list() {
                "$backend" "$OPT_PROTOCOL" "$OPT_MAX_DELAY" "$OPT_MIRRORS"
         printf '## Region: %s\n' "${cc:-auto/global}${filter:+ (candidates: $filter)}"
         printf '##\n\n'
+        # reflector 兼容行：sysup 等工具靠它判断镜像源时效（格式必须是
+        # "YYYY-MM-DD HH:MM:SS UTC"，且必须用单个 # 开头）
+        printf '# When:       %s UTC\n\n' "$(date -u '+%Y-%m-%d %H:%M:%S')"
         cat "$src"
         if [[ -n "$fallback" && "$OPT_FALLBACK" == true ]]; then
             printf '\n## %s\n' "$(msg fallback_note)"
@@ -610,6 +634,7 @@ main() {
 
     # 4. 初始化
     mkdir -p "$CACHE_DIR" 2>/dev/null || die "cannot create $CACHE_DIR"
+    LOG_FILE="$CACHE_DIR/last-run.log"
     # 单一 trap：负责临时文件清理 + 失败的镜像列表回滚
     trap cleanup EXIT INT TERM HUP
     local tmp_list tmp_cn

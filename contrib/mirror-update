@@ -1,0 +1,30 @@
+#!/usr/bin/env bash
+# ==============================================================================
+#  接入 sysup（shorin-contrib）的入口脚本
+#
+#  sysup 的 find_mirror_script() 只认 `mirror-update` 这个名字：
+#      find_mirror_script() { command -v mirror-update ... }
+#  所以把 ~/.local/bin/mirror-update 软链到本文件，sysup 的镜像更新步骤
+#  就会走 upmirror：
+#      ln -sf ~/Projects/upmirror/contrib/mirror-update ~/.local/bin/mirror-update
+#
+#  另外 sysup 靠 mirrorlist 里的 `# When: <UTC>` 行判断时效（>30 天才更新），
+#  upmirror 生成的文件里带有这一行，因此时效检查能正常生效。
+#
+#  -y : 跳过交互确认（sysup 流程里不该再问地区）
+#  -q : 测速输出写进 ~/.cache/upmirror/last-run.log，不糊满 sysup 的输出
+# ==============================================================================
+
+set -euo pipefail
+
+if command -v upmirror >/dev/null 2>&1; then
+    exec upmirror -y -q "$@"
+fi
+
+# 退化：没有 upmirror 时用 shorin-contrib 原来的脚本（reflector 后端）
+if [[ -x /usr/lib/shorin-contrib/mirror-update ]]; then
+    exec /usr/lib/shorin-contrib/mirror-update "$@"
+fi
+
+echo "错误: 既找不到 upmirror，也找不到 /usr/lib/shorin-contrib/mirror-update" >&2
+exit 1
