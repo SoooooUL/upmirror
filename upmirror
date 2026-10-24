@@ -7,10 +7,14 @@
 #
 #  主要特性：
 #    1. 自动识别所在地区（时区 → IP 定位兜底 → 手动指定）
-#    2. 带时间戳备份 + 失败/中断自动回滚（trap EXIT/INT/TERM）
-#    3. 写入前校验：空列表 / 无效列表绝不落盘
-#    4. 原子替换：先写临时文件再 mv 覆盖，避免半截文件
-#    5. 可选同步更新 archlinuxcn 镜像列表（--cn）
+#    2. 写入前「同步一致性校验」：拿各镜像的 core.db / extra.db 时间戳与官方
+#       geomirror 比对，把滞后超过阈值的站点排到列表末尾 —— 只按速度排序会选到
+#       「core 旧、extra 新」的镜像，进而导致部分升级（partial upgrade）
+#    3. 带时间戳备份 + 失败/中断自动回滚（trap EXIT/INT/TERM）
+#    4. 写入前校验：空列表 / 无效列表绝不落盘
+#    5. 原子替换：先写临时文件再 mv 覆盖，避免半截文件
+#    6. 可选同步更新 archlinuxcn 镜像列表（--cn）
+#    7. 可选写入后强制刷库（--sync → pacman -Syy）
 #
 #  用法：upmirror [选项]（见 upmirror --help）
 # ==============================================================================
@@ -18,7 +22,7 @@
 set -uo pipefail
 
 PROG="${0##*/}"
-VERSION="1.0.0"
+VERSION="1.1.0"
 
 # ---------- 路径与常量 ----------
 TARGET_MIRRORLIST="/etc/pacman.d/mirrorlist"
@@ -36,10 +40,23 @@ KEEP_BACKUPS=10          # 每个目标文件保留的备份份数
 readonly FALLBACK_MIRROR='https://mirrors.cernet.edu.cn/archlinux/$repo/os/$arch'
 readonly FALLBACK_CN_MIRROR='https://mirrors.cernet.edu.cn/archlinuxcn/$arch'
 
+# ---------- 一致性校验的官方基准 ----------
+# 官方 geomirror（Tier 1，geo.mirror.pkgbuild.com 会按地理位置跳到就近的 Tier 1）。
+# 用它的 core.db / extra.db 的 Last-Modified 作为「最新快照」基准，逐个比对候选镜像。
+readonly BASELINE_MIRROR='https://geo.mirror.pkgbuild.com/$repo/os/$arch'
+# 单个探测请求的超时（秒）。超时直接当「未知」处理，不重试 ——
+# 慢镜像本来就该被怀疑，不能让它拖垮整个脚本。
+readonly PROBE_TIMEOUT=5
+# 本机架构：把 mirrorlist 里的 $arch 占位符展开成真实路径
+readonly ARCH="$(uname -m)"
+
 # ---------- 默认选项 ----------
 OPT_CC=""                # 国家/地区 ISO 代码，空 = 自动检测
 OPT_MIRRORS=10           # 写入 mirrorlist 的镜像数量
-OPT_MAX_DELAY=43200      # 最大同步延迟（秒），12 小时
+OPT_MAX_DELAY=7200       # 最大同步延迟（秒），2 小时
+OPT_CHECK=true           # 写入前做同步一致性校验（防部分升级）
+OPT_TOLERANCE=3600       # 一致性校验容忍的落后秒数，1 小时
+OPT_SYNC=false           # 写入后执行 pacman -Syy 强制刷库
 OPT_PROTOCOL="https"     # https / http / both
 OPT_CONCURRENCY=16       # 并发测速数
 OPT_PER_COUNTRY=5        # 每国测试的镜像数
@@ -63,7 +80,7 @@ declare -A M_ZH=(
     [opt_title]="选项："
     [help_cc]="手动指定国家/地区 ISO 代码（如 CN、JP、US）"
     [help_mirrors]="写入镜像列表的服务器数量（默认 10）"
-    [help_delay]="镜像最大同步延迟秒数（默认 43200 = 12 小时）"
+    [help_delay]="镜像最大同步延迟秒数（默认 7200 = 2 小时）"
     [help_proto]="测速使用的协议：https | http | both（默认 https）"
     [help_conc]="并发测速数（默认 16）"
     [help_per_country]="每个国家测速的镜像数量（默认 5）"
@@ -74,6 +91,24 @@ declare -A M_ZH=(
     [help_yes]="跳过交互确认（用于脚本/定时任务）"
     [help_quiet]="安静模式：测速输出写入日志文件而非终端"
     [quiet_log]="测速完整日志"
+    [help_check]="写入前校验候选镜像是否落后于官方快照（默认开启）"
+    [help_no_check]="关闭同步一致性校验"
+    [help_tolerance]="一致性校验容忍的落后秒数（默认 3600 = 1 小时）"
+    [help_sync]="写入后执行 sudo pacman -Syy 强制刷新数据库"
+    [check_title]="同步一致性校验（基准：官方 geomirror）"
+    [check_lag]="落后官方"
+    [check_ok]="优先"
+    [check_stale]="降序"
+    [check_unknown]="未知"
+    [check_network]="超过一半的镜像探测不到时间戳，可能是本地网络问题；这些镜像标记为未知并保留"
+    [check_baseline]="获取不到官方基准时间，已跳过一致性校验（可用 --no-check 彻底关掉）"
+    [check_all_ok]="全部候选镜像均与官方同步"
+    [check_demoted]="一致性较差的镜像已排到列表末尾"
+    [few_mirrors]="实际写入的镜像少于 --mirrors，可用镜像不足（--mirrors 是上限）"
+    [sync_running]="正在强制刷新 pacman 数据库..."
+    [sync_ok]="数据库已刷新"
+    [sync_fail]="刷新数据库失败（镜像列表已写入，可稍后手动执行 pacman -Syy）"
+    [sync_hint]="若出现「已装包比镜像里新」的情况，请执行 sudo pacman -Syyuu 对齐，避免部分升级"
     [help_no_fallback]="不在末尾追加 CERNET 联合镜像站保底"
     [fallback_note]="保底镜像（CERNET 联合镜像站，自动跳转到最近可用镜像）"
     [help_help]="显示本帮助"
@@ -87,7 +122,7 @@ declare -A M_ZH=(
     [confirm_region]="使用该地区吗? [Y/n]: "
     [ask_cc]="请输入国家/地区 ISO 代码（如 CN、JP、US）: "
     [using_region]="目标地区"
-    [global_mode]="未指定地区，将在全球范围内选择最快镜像"
+    [global_mode]="未指定地区，将在全球范围内选择最快镜像（入口国家用后端默认值，结果可能偏远）"
     [no_tool]="未找到 rate-mirrors 或 reflector，请先安装: sudo pacman -S rate-mirrors"
     [need_sudo]="请求管理员权限..."
     [backup_saved]="备份已保存至"
@@ -123,7 +158,7 @@ declare -A M_EN=(
     [opt_title]="Options:"
     [help_cc]="Set country/region ISO code manually (e.g. CN, JP, US)"
     [help_mirrors]="Number of servers to write into the mirrorlist (default 10)"
-    [help_delay]="Max mirror sync delay in seconds (default 43200 = 12h)"
+    [help_delay]="Max mirror sync delay in seconds (default 7200 = 2h)"
     [help_proto]="Protocol used for speed test: https | http | both (default https)"
     [help_conc]="Number of simultaneous speed tests (default 16)"
     [help_per_country]="Number of mirrors to test per country (default 5)"
@@ -134,6 +169,24 @@ declare -A M_EN=(
     [help_yes]="Skip interactive confirmation (for scripts/cron)"
     [help_quiet]="Quiet mode: write ranking output to a log file instead of the terminal"
     [quiet_log]="Full ranking log"
+    [help_check]="Verify candidate mirrors are in sync with upstream before writing (default)"
+    [help_no_check]="Disable the sync consistency check"
+    [help_tolerance]="Tolerated lag behind upstream in seconds (default 3600 = 1h)"
+    [help_sync]="Run sudo pacman -Syy after writing"
+    [check_title]="Sync consistency check (baseline: official geomirror)"
+    [check_lag]="lag"
+    [check_ok]="top"
+    [check_stale]="demoted"
+    [check_unknown]="unknown"
+    [check_baseline]="Cannot fetch the official baseline, skipping the consistency check (use --no-check to skip it entirely)"
+    [check_all_ok]="All candidates are in sync with upstream"
+    [check_network]="More than half of the mirrors gave no timestamp (local network issue?); they are kept as unknown"
+    [check_demoted]="Out-of-sync mirrors were moved to the end of the list"
+    [few_mirrors]="Wrote fewer mirrors than --mirrors asked for, not enough candidates available"
+    [sync_running]="Force refreshing the pacman database..."
+    [sync_ok]="Database refreshed"
+    [sync_fail]="Refresh failed (mirrorlist was written; run pacman -Syy manually later)"
+    [sync_hint]="If installed packages are newer than the mirror offers, run sudo pacman -Syyuu to realign"
     [help_no_fallback]="Do not append the CERNET last-resort mirror"
     [fallback_note]="last-resort mirror (CERNET, auto-redirects to the nearest one)"
     [help_help]="Show this help"
@@ -147,7 +200,7 @@ declare -A M_EN=(
     [confirm_region]="Use this region? [Y/n]: "
     [ask_cc]="Enter country/region ISO code (e.g. CN, JP, US): "
     [using_region]="Target region"
-    [global_mode]="No region set, picking the fastest mirrors worldwide"
+    [global_mode]="No region set, picking the fastest mirrors worldwide (backend's default entry country, may be distant)"
     [no_tool]="Neither rate-mirrors nor reflector found. Install: sudo pacman -S rate-mirrors"
     [need_sudo]="Requesting sudo privileges..."
     [backup_saved]="Backup saved to"
@@ -203,6 +256,7 @@ have() { command -v "$1" >/dev/null 2>&1; }
 # ---------- 回滚/清理机制 ----------
 declare -a RB_TARGETS=() RB_BACKUPS=() RB_STATE=()   # 状态: yes(原本存在) / no(原本不存在) / unknown(备份失败)
 declare -a TMP_FILES=()
+declare -a ATOMIC_TMPS=()   # install_atomic 用过的临时路径，退出时兜底清理
 SCRIPT_OK=false
 
 # 创建临时文件并登记（退出时统一删除）
@@ -242,8 +296,14 @@ register_target() {
 
 prune_backups() {
     local base="$1"
-    # 备份均为用户属主，可直接删除；保留最近 KEEP_BACKUPS 份
-    ls -1t "$CACHE_DIR/$base".*.bak 2>/dev/null | tail -n "+$((KEEP_BACKUPS + 1))" | xargs -r rm -f
+    # 按文件名排序，不能按 mtime：备份用 `cp -p` 保留了原文件的 mtime，
+    # 按 mtime 排等于按「被备份文件的时间」排，用户手改过 mirrorlist 后会删错文件。
+    # 文件名里的 YYYYmmdd-HHMMSS 可直接字典序。latest.bak 是软链，不占备份份数。
+    ls -1 "$CACHE_DIR/$base".*.bak 2>/dev/null \
+        | grep -v "/$base\\.latest\\.bak$" \
+        | sort -r \
+        | tail -n "+$((KEEP_BACKUPS + 1))" \
+        | xargs -r rm -f
 }
 
 cleanup() {
@@ -269,6 +329,11 @@ cleanup() {
         done
     fi
     clean_tmp
+    # install_atomic 中途失败残留的半成品（sudo 属主，必须 sudo 删）
+    local f
+    for f in "${ATOMIC_TMPS[@]:-}"; do
+        [[ -n "$f" && -e "$f" ]] && sudo rm -f -- "$f" 2>/dev/null
+    done
     exit "$code"
 }
 
@@ -291,6 +356,10 @@ $(msg opt_title)
       --cn                 $(msg help_cn)
       --backend <B>        $(msg help_backend)
       --dry-run            $(msg help_dryrun)
+      --check              $(msg help_check)
+      --no-check           $(msg help_no_check)
+      --tolerance <SEC>    $(msg help_tolerance)
+      --sync               $(msg help_sync)
       --no-fallback        $(msg help_no_fallback)
   -y, --yes                $(msg help_yes)
   -q, --quiet              $(msg help_quiet)
@@ -319,6 +388,10 @@ $(msg opt_title)
       --cn                 $(msg help_cn)
       --backend <B>        $(msg help_backend)
       --dry-run            $(msg help_dryrun)
+      --check              $(msg help_check)
+      --no-check           $(msg help_no_check)
+      --tolerance <SEC>    $(msg help_tolerance)
+      --sync               $(msg help_sync)
       --no-fallback        $(msg help_no_fallback)
   -y, --yes                $(msg help_yes)
   -q, --quiet              $(msg help_quiet)
@@ -353,6 +426,10 @@ parse_args() {
             --cn)            OPT_CN=true ;;
             --backend)       shift; OPT_BACKEND="${1:-}" ;;
             --dry-run)       OPT_DRYRUN=true; SCRIPT_OK=true ;;   # 不写文件，无需回滚
+            --check)         OPT_CHECK=true ;;
+            --no-check)      OPT_CHECK=false ;;
+            --tolerance)     shift; need_int "--tolerance" "${1:-}"; OPT_TOLERANCE="$1" ;;
+            --sync)          OPT_SYNC=true ;;
             -y|--yes)        OPT_YES=true ;;
             -q|--quiet)      OPT_QUIET=true ;;
             --no-fallback)   OPT_FALLBACK=false ;;
@@ -410,10 +487,22 @@ detect_cc_by_tz() {
 }
 
 detect_cc_by_ip() {
-    local cc=""
+    local raw="" src
     have curl || return 0
-    cc="$(curl -fsS --max-time 3 https://ipapi.co/country 2>/dev/null | tr -d '[:space:]')"
-    [[ "$cc" =~ ^[A-Za-z]{2}$ ]] && printf '%s' "${cc^^}"
+    # 多源兜底 + 强制 IPv4：单个服务很容易在特定地区不可达，
+    # 且 IPv6 不通时每个源都要白等满超时
+    for src in 'https://ipapi.co/country' \
+               'https://ipinfo.io/country' \
+               'https://api.country.is/'; do
+        raw="$(curl -4 -fsS --max-time 3 -- "$src" 2>/dev/null | tr -d '[:space:]')"
+        # JSON 源（api.country.is）取 "country":"XX"
+        if [[ "$raw" =~ \"country\":\"([A-Za-z]{2})\" ]]; then
+            printf '%s' "${BASH_REMATCH[1]^^}"; return 0
+        fi
+        # 纯文本源直接就是两位代码
+        [[ "$raw" =~ ^[A-Za-z]{2}$ ]] && { printf '%s' "${raw^^}"; return 0; }
+    done
+    return 0
 }
 
 # 名称/代码 → 2 位代码（全名需 reflector 的国家表）
@@ -440,6 +529,21 @@ cc_to_name() {
         { if (match($0, /[ \t][A-Z][A-Z][ \t]+[0-9]+[ \t]*$/)) {
               if (substr($0, RSTART+1, 2) == want) {
                   name = substr($0, 1, RSTART-1); gsub(/[ \t]+$/, "", name); print name; exit } } }'
+}
+
+# 逗号分隔的代码列表 → reflector 用的国家全名列表（转不出来的保留原代码）
+cc_names() {   # $1=候选代码列表（可为空） $2=基础 cc
+    local list="${1:-$2}" out="" code name
+    local -a codes=()
+    [[ -n "$list" ]] || return 1
+    IFS=',' read -ra codes <<< "$list"
+    for code in "${codes[@]}"; do
+        [[ -n "$code" ]] || continue
+        name="$(cc_to_name "$code" 2>/dev/null)"
+        [[ -n "$name" ]] || name="$code"   # 新版本 reflector 也接受代码
+        out="${out:+$out,}$name"
+    done
+    printf '%s' "$out"
 }
 
 # 邻近国家/地区（只用于 --neighbors 放宽范围）
@@ -485,8 +589,9 @@ pick_backend() {
 run_backend() {
     local backend="$1" out="$2"; shift 2
     if [[ "$backend" == "reflector" ]]; then
-        # reflector 的日志可能混入 stdout，只保留注释与 Server 行
-        "$@" 2>/dev/null | grep -E '^(#|Server[[:space:]]*=)' > "$out"
+        # reflector 自己会输出 "# When:" 头部，compose_list 还会再写一条给 sysup，
+        # 这里先滤掉，避免文件里出现两个 "# When:"（按首行解析的工具会困惑）
+        "$@" 2>/dev/null | grep -E '^(#|Server[[:space:]]*=)' | grep -vE '^#[[:space:]]*When:' > "$out"
         return "${PIPESTATUS[0]}"
     fi
     "$@"
@@ -501,33 +606,41 @@ generate_list() {
         rate-mirrors)
             cmd=(rate-mirrors
                  --concurrency="$OPT_CONCURRENCY"
-                 --entry-country="${cc:-US}"
                  --country-test-mirrors-per-country="$OPT_PER_COUNTRY"
                  --max-mirrors-to-output="$OPT_MIRRORS"
                  --disable-comments-in-file
+                 --disable-untested-fallback
                  --save="$out")
+            # 入口国家不能硬编码：全球模式（时区/IP 都没识别出来）下写死 US，
+            # 中文用户会被带到美国镜像。留空则用后端自己的默认值，main 里会提示。
+            [[ -n "$cc" ]] && cmd+=(--entry-country="$cc")
             case "$OPT_PROTOCOL" in
                 https) cmd+=(--protocol=https) ;;
                 http)  cmd+=(--protocol=http) ;;
                 both)  cmd+=(--protocol=http --protocol=https) ;;
             esac
             [[ -n "$filter" ]] && cmd+=(--include-countries="$filter")
-            cmd+=(arch --max-delay="$OPT_MAX_DELAY")
+            # --completion=1：正在同步中的镜像（completion < 1）直接排除
+            # --max-delay：只要最近同步过的，语义与 OPT_MAX_DELAY 一致
+            cmd+=(arch --completion=1 --max-delay="$OPT_MAX_DELAY")
             ;;
         reflector)
-            local name age_h
-            name="$(cc_to_name "$cc")"
-            [[ -n "$name" ]] || return 1
-            age_h=$(( OPT_MAX_DELAY / 3600 )); (( age_h < 1 )) && age_h=1
+            # reflector 的 --country 支持逗号多国，所以 --neighbors 在这里也能生效
+            local countries
+            countries="$(cc_names "$filter" "$cc")"
+            [[ -n "$countries" ]] || return 1
             local proto="https"
             case "$OPT_PROTOCOL" in
                 both) proto="http,https" ;;
                 *)    proto="$OPT_PROTOCOL" ;;
             esac
+            # --delay 接受小数（小时），直接对应 OPT_MAX_DELAY；
+            # 旧写法 --age 取整到小时，传 --max-delay 1800 会被放大成 1 小时
             cmd=(reflector --sort rate --verbose --download-timeout 5
                  --protocol "$proto"
-                 --age "$age_h" --fastest "$OPT_MIRRORS"
-                 --country "$name")
+                 --delay "$(awk -v s="$OPT_MAX_DELAY" 'BEGIN{printf "%.4f", s / 3600}')"
+                 --fastest "$OPT_MIRRORS"
+                 --country "$countries")
             ;;
         *) return 1 ;;
     esac
@@ -541,12 +654,181 @@ generate_list() {
     fi
 }
 
-# 校验：非空、至少一行 Server =
+# 统计有效 Server 行数（要求带协议前缀，拒绝写进去的垃圾行）
+server_count() {
+    grep -cE '^[[:space:]]*Server[[:space:]]*=[[:space:]]*(https?|rsync|ftp|file)://' "$1" 2>/dev/null || true
+}
+
+# 校验：非空、至少一行合法 Server =
 validate_list() {
     local f="$1" n
     [[ -s "$f" ]] || return 1
-    n="$(grep -cE '^[[:space:]]*Server[[:space:]]*=' "$f")"
-    [[ "$n" -gt 0 ]] || return 1
+    n="$(server_count "$f")"
+    [[ "${n:-0}" -gt 0 ]] || return 1
+    return 0
+}
+
+# ---------- 同步一致性校验 ----------
+# Arch Wiki 的 Mirrors 页写得很清楚：只按速度排序是不够的，最快的镜像可能已经过期。
+# 更阴的是「只同步了一半」的镜像：core 旧、extra 新，于是 pacman 在同一事务里
+# 拿到了两套时间点的数据库 —— perl 本体还留在旧版，而依赖它的 Perl 模块
+# 已经按新版重编译，装完就报 Can't locate ... in @INC（部分升级）。
+#
+# rate-mirrors / reflector 用的都是镜像站自己上报的 last_sync / delay，
+# 只能说明「最近同步过」，盖不住单个仓库的滞后。这里直接拿官方 geomirror
+# 的 core.db / extra.db 时间戳做基准，逐个比对候选镜像的同类文件。
+
+# 秒数 → 人类可读（负数视为 0：镜像比基准新就是不落后）
+fmt_dur() {
+    local s="$1"
+    (( s < 0 )) && s=0
+    if   (( s >= 86400 )); then printf '%dd%dh' $(( s / 86400 )) $(( s % 86400 / 3600 ))
+    elif (( s >= 3600 ));  then printf '%dh%dm' $(( s / 3600 ))  $(( s % 3600 / 60 ))
+    elif (( s >= 60 ));    then printf '%dm%ds' $(( s / 60 ))    $(( s % 60 ))
+    else printf '%ds' "$s"
+    fi
+}
+
+# 读取 URL 的 Last-Modified，输出 epoch 秒；拿不到则输出空串
+# 用 -L 跟随 302（cernet 联合镜像站这类入口会跳转到成员站）；
+# 跟随重定向后会有多组响应头，取最后一组。
+# 关键细节：一次请求同时把状态码拿回来，才能区分「超时/连不上」（code=000，
+# 再发一次 GET 也是白等）与「站点不支持 HEAD」（405/501，才值得重试）。
+# 不挂代理、网络卡的时候，后者是少数，前者占绝大多数。
+fetch_last_modified() {
+    local url="$1" out="" code="" hdr=""
+    have curl || return 0
+    out="$(curl -4 -sS -I -L --max-redirs 5 --max-time "$PROBE_TIMEOUT" \
+           -o /dev/null -D - -w '\nHTTPCODE:%{http_code}' -- "$url" 2>/dev/null)"
+    code="$(printf '%s' "$out" | sed -n 's/^HTTPCODE://p' | tail -n1)"
+    hdr="$(printf '%s' "$out" | tr -d '\r' \
+           | sed -n 's/^[Ll]ast-[Mm]odified:[[:space:]]*//p' | tail -n1)"
+    if [[ -z "$hdr" && ( "$code" == "405" || "$code" == "501" ) ]]; then
+        # 该站明确拒绝 HEAD，退回「只取 1 字节的 GET」拿响应头
+        out="$(curl -4 -sS -r 0-0 -L --max-redirs 5 --max-time "$PROBE_TIMEOUT" \
+               -o /dev/null -D - -- "$url" 2>/dev/null)"
+        hdr="$(printf '%s' "$out" | tr -d '\r' \
+               | sed -n 's/^[Ll]ast-[Mm]odified:[[:space:]]*//p' | tail -n1)"
+    fi
+    [[ -n "$hdr" ]] || return 0
+    date -u -d "$hdr" +%s 2>/dev/null
+}
+
+# 某个镜像某个仓库的 db 文件的 Last-Modified → epoch
+mirror_db_epoch() {   # $1=镜像 URL  $2=core|extra
+    local url="${1//\$repo/$2}"
+    url="${url//\$arch/$ARCH}"
+    [[ "$url" == */ ]] || url="$url/"
+    fetch_last_modified "${url}$2.db"
+}
+
+# 并行探测所有 URL。结果写到目录里（每个 URL 一个文件），
+# 避免后台子 shell 里的变量赋值丢失。
+# watchdog：单个 URL 最坏 PROBE_TIMEOUT秒×2（core + extra），超过上限还没回来的
+# 直接 kill（该镜像记为「未知」）—— 网络卡不影响脚本继续往下跑。
+probe_all() {   # $1=输出目录 $2..=URL
+    local dir="$1"; shift
+    local i=0 url pid alive waited limit
+    local -a pids=()
+    for url in "$@"; do
+        i=$((i + 1))
+        ( printf '%s\t%s\t%s\n' "$url" \
+              "$(mirror_db_epoch "$url" core)" \
+              "$(mirror_db_epoch "$url" extra)" > "$dir/$i" ) &
+        pids+=("$!")
+    done
+    limit=$(( PROBE_TIMEOUT * 2 + 3 )); waited=0
+    while (( waited < limit )); do
+        alive=0
+        for pid in "${pids[@]}"; do
+            kill -0 "$pid" 2>/dev/null && alive=$((alive + 1))
+        done
+        (( alive == 0 )) && break
+        sleep 1
+        waited=$((waited + 1))
+    done
+    for pid in "${pids[@]}"; do
+        kill -0 "$pid" 2>/dev/null && kill "$pid" 2>/dev/null
+    done
+    wait 2>/dev/null || true
+}
+
+# 排序方法（不是过滤）：滞后超过 OPT_TOLERANCE 的排到最后；拿不到时间戳的
+# 排在中间；其余保持后端测速给出的相对顺序。三档都保留，不会丢镜像。
+check_mirror_consistency() {   # $1=输入列表 $2=输出列表
+    local in="$1" out="$2"
+    local -a urls=()
+    # 只取合法行（带协议前缀），与 server_count 保持同一套判定：
+    # 否则 "Server = garbage" 这种垃圾行也会被当成镜像去探测，
+    # 探测必然失败 → 归入「未知」档 → 又被写回最终文件。
+    mapfile -t urls < <(grep -E '^[[:space:]]*Server[[:space:]]*=[[:space:]]*(https?|rsync|ftp|file)://' "$in" \
+                        | sed -E 's/^[[:space:]]*Server[[:space:]]*=[[:space:]]*//')
+    if (( ${#urls[@]} == 0 )); then cp -- "$in" "$out"; return 0; fi
+
+    printf '\n%s%s%s\n' "$C_CYAN" "$(msg check_title)" "$C_NC"
+
+    local dir; dir="$(mktemp -d "$CACHE_DIR/probe.XXXXXX")" || { cp -- "$in" "$out"; return 0; }
+    # 基准和候选镜像一起并行探测：基准不再单独串行占一份超时
+    probe_all "$dir" "$BASELINE_MIRROR" "${urls[@]}"
+
+    local bc="" be=""
+    [[ -f "$dir/1" ]] && IFS=$'\t' read -r _ bc be < "$dir/1"
+    if [[ -z "$bc" || -z "$be" ]]; then
+        warn "$(msg check_baseline)"
+        rm -rf -- "$dir"
+        cp -- "$in" "$out"
+        return 0
+    fi
+
+    local i url c e lc le name mark unknown=0
+    # 三档排序，各档内部保持后端测速给出的相对顺序：
+    #   好（与官方同步） → 未知（探不到时间戳） → 差（滞后超过容忍度）
+    # 一致性差的只往后排、不剔除：它们是有效的备用镜像，前面的都挂了仍能
+    # 顶上，又不会因「core 旧、extra 新」而在正常升级时被优先选中。
+    local -a ok_urls=() unknown_urls=() stale_urls=()
+    printf '%s  %-40s %-12s %-12s %s%s\n' "$C_DIM" "mirror" "core" "extra" "" "$C_NC"
+    for i in "${!urls[@]}"; do
+        url="${urls[$i]}"
+        c=""; e=""
+        [[ -f "$dir/$((i + 2))" ]] && IFS=$'\t' read -r _ c e < "$dir/$((i + 2))"
+        # 只显示 host，完整路径太长
+        name="${url#*://}"; name="${name%%/*}"
+        if [[ -z "$c" || -z "$e" ]]; then
+            mark="$(msg check_unknown)"
+            unknown=$((unknown + 1))
+            unknown_urls+=("$url")
+            printf '  %-40s %-12s %-12s %s%s%s\n' "$name" '-' '-' "$C_YELLOW" "$mark" "$C_NC"
+            continue
+        fi
+        lc=$(( bc - c )); le=$(( be - e ))
+        if (( lc > OPT_TOLERANCE || le > OPT_TOLERANCE )); then
+            mark="$(msg check_stale)"
+            stale_urls+=("$url")
+            printf '  %-40s %-12s %-12s %s%s%s\n' "$name" \
+                   "$(fmt_dur "$lc")" "$(fmt_dur "$le")" "$C_RED" "$mark" "$C_NC"
+        else
+            mark="$(msg check_ok)"
+            ok_urls+=("$url")
+            printf '  %-40s %-12s %-12s %s%s%s\n' "$name" \
+                   "$(fmt_dur "$lc")" "$(fmt_dur "$le")" "$C_GREEN" "$mark" "$C_NC"
+        fi
+    done
+    rm -rf -- "$dir"
+
+    # 大面积探测失败通常是本地网络问题（比如没挂代理），不是镜像坏了，
+    # 这时只提示，不要因此改变列表
+    if (( unknown > 0 && unknown * 2 >= ${#urls[@]} )); then
+        warn "$(msg check_network)"
+    fi
+
+    # 按档位重新拼接（全部滞后的情况自然退化为「原顺序」）
+    printf 'Server = %s\n' "${ok_urls[@]}" "${unknown_urls[@]}" "${stale_urls[@]}" > "$out"
+    if (( ${#stale_urls[@]} > 0 )); then
+        warn "$(msg check_demoted): ${#stale_urls[@]}"
+    elif (( unknown == 0 )); then
+        # 有未知镜像时不说「全部与官方同步」，那是不准确的
+        ok "$(msg check_all_ok)"
+    fi
     return 0
 }
 
@@ -579,10 +861,16 @@ install_atomic() {
     # 注意: 不能写成 local src="$1" dst="$2" tmp="$dst.upmirror.new"
     # 同一行内 $dst 尚未生效，set -u 会直接报“未绑定的变量”
     tmp="$dst.upmirror.new"
-    sudo cp -- "$src" "$tmp" \
+    ATOMIC_TMPS+=("$tmp")
+    if sudo cp -- "$src" "$tmp" \
         && sudo chmod 0644 "$tmp" \
         && sudo chown root:root "$tmp" \
-        && sudo mv -f -- "$tmp" "$dst"
+        && sudo mv -f -- "$tmp" "$dst"; then
+        return 0
+    fi
+    # 中途失败：立刻清掉半成品，不留 sudo 属主的残留文件
+    sudo rm -f -- "$tmp" 2>/dev/null
+    return 1
 }
 
 # ---------- 主流程 ----------
@@ -637,7 +925,7 @@ main() {
     LOG_FILE="$CACHE_DIR/last-run.log"
     # 单一 trap：负责临时文件清理 + 失败的镜像列表回滚
     trap cleanup EXIT INT TERM HUP
-    local tmp_list tmp_cn
+    local tmp_list tmp_cn checked
     new_tmp tmp_list list
 
     # 5. 测速生成
@@ -647,9 +935,23 @@ main() {
         die "$(msg invalid_result)"
     fi
 
+    # 5.5 同步一致性校验：把「core 旧、extra 新」这类会引发部分升级的镜像排到末尾
+    new_tmp checked checked
+    if [[ "$OPT_CHECK" == true ]]; then
+        check_mirror_consistency "$tmp_list" "$checked"
+    else
+        cp -- "$tmp_list" "$checked"
+    fi
+
+    local n_servers
+    n_servers="$(server_count "$checked")"
+    if (( n_servers < OPT_MIRRORS )); then
+        info "$(msg few_mirrors): ${n_servers} < ${OPT_MIRRORS}"
+    fi
+
     # 6. 组装最终内容（头部注释 + 镜像 + 保底）
     local final; new_tmp final final
-    compose_list "$tmp_list" "$final" "$backend" "$cc" "$filter" "$FALLBACK_MIRROR"
+    compose_list "$checked" "$final" "$backend" "$cc" "$filter" "$FALLBACK_MIRROR"
 
     printf '\n%s%s%s\n' "$C_CYAN" "$(msg result_title)" "$C_NC"
     grep -E '^[[:space:]]*Server[[:space:]]*=' "$final" | nl -ba -w2 -s'. ' || true
@@ -696,6 +998,18 @@ main() {
         else
             warn "$(msg cn_failed)"
         fi
+    fi
+
+    # 11. 可选：强制刷新数据库（只刷库，不升级）
+    if [[ "$OPT_SYNC" == true ]]; then
+        printf '\n'
+        info "$(msg sync_running)"
+        if sudo pacman -Syy; then
+            ok "$(msg sync_ok)"
+        else
+            warn "$(msg sync_fail)"
+        fi
+        printf '%s\n' "$(msg sync_hint)"
     fi
 
     printf '\n'

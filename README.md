@@ -15,10 +15,59 @@ Arch Linux 镜像源更新器 —— 默认基于 [rate-mirrors](https://github.
 ## 特性
 
 1. **自动识别地区**：时区映射 → IP 定位兜底 → 手动 `-c` 指定
-2. **失败自动回滚**：写入前备份，脚本中断/出错时 `trap` 自动还原原文件
-3. **绝不写坏文件**：写入前校验（非空、至少一行 `Server =`），且原子替换
-4. **保底镜像**：末尾追加教育网联合镜像站，前面全部不可用时仍能救急
-5. **可选 archlinuxcn**：`--cn` 一并更新 `/etc/pacman.d/archlinuxcn-mirrorlist`
+2. **同步一致性校验（默认开）**：写入前把每个候选镜像的 `core.db` / `extra.db`
+   的 `Last-Modified` 与官方 geomirror 比对，把滞后超过阈值的镜像
+   **排到列表末尾**（不剔除）—— 只按速度排序会选到「core 旧、extra 新」的
+   镜像，进而导致部分升级（见下文）
+3. **失败自动回滚**：写入前备份，脚本中断/出错时 `trap` 自动还原原文件
+4. **绝不写坏文件**：写入前校验（非空、带协议的 `Server =`），且原子替换
+5. **保底镜像**：末尾追加教育网联合镜像站，前面全部不可用时仍能救急
+6. **可选 archlinuxcn**：`--cn` 一并更新 `/etc/pacman.d/archlinuxcn-mirrorlist`
+7. **可选强制刷库**：`--sync` 写入后执行 `pacman -Syy`
+
+## 为什么需要「同步一致性校验」
+
+Arch Wiki 的 [Mirrors](https://wiki.archlinux.org/title/Mirrors) 页写得很直接：
+*"It is not optimal to only rank mirrors based on speed since the fastest servers
+might be out-of-sync."* 但比「整个镜像旧」更阴的是**只同步了一半**的镜像。
+
+实测案例（2026-10-19，本机）：
+
+| 镜像 | core.db `Last-Modified` | extra.db `Last-Modified` | 后果 |
+|---|---|---|---|
+| mirrors.aliyun.com | 10-18 15:47 UTC | 10-19 07:21 UTC | core 落后 **15h33m** |
+| mirror.nyist.edu.cn | 10-18 18:00 UTC | 10-19 00:56 UTC | core 落后 **15h33m** |
+| mirrors.xjtu.edu.cn | 10-19 07:21 UTC | 10-19 07:54 UTC | extra 落后 **2h23m** |
+| mirrors.jlu.edu.cn | 10-19 07:21 UTC | 10-19 10:08 UTC | 正常（9m） |
+
+`perl` 在 **core**，而所有 `perl-*` 模块在 **extra**。于是 pacman 拿着
+「旧 core + 新 extra」两套时间点的数据库做了一次事务：
+
+- `perl` 本体仍是 `5.42.3-1`（不升级）
+- `perl-proc-processtable` 等已按 `5.44` 重编译并安装
+- 结果：`needrestart` 钩子报 `Can't locate Proc/ProcessTable.pm in @INC`
+
+`rate-mirrors --max-delay` 和 `reflector --delay` 用的都是镜像站上报的
+`last_sync` / `delay`，只能说明「最近同步过」，**盖不住单个仓库的滞后**：
+阿里云当时 `delay` 约 8.6 小时，小于原先 12 小时的阈值，顺利通过筛选。
+
+所以 upmirror 现在直接探测各镜像 `core.db` / `extra.db` 的 `Last-Modified`，
+以官方 `geo.mirror.pkgbuild.com` 为基准逐个比对。
+
+**不会被网络拖住**：
+
+- 每个请求 `--max-time 5`，所有镜像（含基准站）**并行**探测
+- 超时直接当「未知」，**不会**再发第二次请求（只有站点明确回 405/501
+  不支持 HEAD 时，才退回「只取 1 字节的 GET」）
+- 单个探测子进程有 watchdog，最长 `5×2+3 = 13` 秒后强杀
+- 基准站拿不到 → 打印警告、**跳过一次致性校验**，列表原样写入
+- 拿不到时间戳的镜像标为「未知」并**保留**，不会因为网络差把列表清空
+- 超过一半镜像探测失败时会提示「可能是本地网络问题」
+
+实测：裸连（无代理）下整个校验约 2 秒；两个黑洞地址 10 秒；基准站
+不可达 11 秒后跳过。真不想等就用 `--no-check` 关掉。
+
+用 `--tolerance` 调容忍秒数（默认 3600），或用 `--no-check` 关闭。
 
 ## 依赖
 
@@ -42,6 +91,7 @@ upmirror -c JP                    # 强制使用日本镜像
 upmirror --neighbors              # 放宽到邻近国家/地区（如 CN,HK,TW,JP,KR,SG）
 upmirror --cn                     # 顺带更新 archlinuxcn 镜像列表
 upmirror --dry-run                # 只测速并打印，不写入任何文件
+upmirror --sync                   # 写入后顺手 pacman -Syy 强制刷库
 upmirror -y                       # 跳过交互确认（适合定时任务）
 ```
 
@@ -51,7 +101,7 @@ upmirror -y                       # 跳过交互确认（适合定时任务）
 |---|---|---|
 | `-c, --country <CC>` | 国家/地区 ISO 代码（也接受国家全名） | 自动检测 |
 | `-n, --mirrors <N>` | 写入列表的服务器数量 | 10 |
-| `--max-delay <SEC>` | 镜像最大同步延迟 | 43200（12h） |
+| `--max-delay <SEC>` | 镜像最大同步延迟 | 7200（2h） |
 | `--protocol <P>` | `https` / `http` / `both` | https |
 | `--concurrency <N>` | 并发测速数 | 16 |
 | `--per-country <N>` | 每国测速镜像数 | 5 |
@@ -59,6 +109,10 @@ upmirror -y                       # 跳过交互确认（适合定时任务）
 | `--cn` | 同时更新 archlinuxcn 镜像列表 | 关 |
 | `--backend <B>` | `auto` / `rate-mirrors` / `reflector` | auto |
 | `--dry-run` | 只预览不写入 | 关 |
+| `--check` | 写入前校验镜像同步是否落后官方 | **开** |
+| `--no-check` | 关闭同步一致性校验 | — |
+| `--tolerance <SEC>` | 一致性校验容忍的落后秒数 | 3600（1h） |
+| `--sync` | 写入后执行 `sudo pacman -Syy` | 关 |
 | `--no-fallback` | 不追加保底镜像 | 关 |
 | `-y, --yes` | 跳过交互确认 | 关 |
 
@@ -88,7 +142,9 @@ mirrorlist.20261016-183500.bak      # 带时间戳
 mirrorlist.latest.bak -> ...        # 最近一次
 ```
 
-- 每个目标文件保留最近 10 份备份，旧的自动清理。
+- 每个目标文件保留最近 10 份备份，旧的自动清理。清理按**文件名**里的时间戳排序，
+  不按 mtime（备份用 `cp -p` 保留了原文件的 mtime，按 mtime 排会在你手改过
+  mirrorlist 之后删错文件）；`latest.bak` 是软链，不占备份份数。
 - 脚本被 `Ctrl-C`、被 kill 或中途出错时，会自动从备份恢复原文件；
   如果目标文件原本不存在，则删除新建的文件。
 - `--dry-run` 不涉及任何写入，自然也不会触发回滚。
@@ -103,6 +159,10 @@ bash tests/smoke.sh
 重点覆盖只有真正写盘时才会执行到的代码路径（原子替换、备份回滚、
 临时文件清理），这类 bug 在 `--dry-run` 下永远不会暴露。
 
+另外用假的 `curl` 注入伪造的 `Last-Modified`，覆盖一致性校验的
+「优先 / 未知 / 降序」三档排序 / `--tolerance` 放宽」四条分支，
+以及备份清理的排序行为（含「软链不计数」「不被 mtime 干扰」）。
+
 ## 实现依据（源码/实测核对）
 
 | 结论 | 依据 |
@@ -113,6 +173,10 @@ bash tests/smoke.sh
 | 下载速度 < 1 B/s 持续 10 秒才放弃该镜像 | `dload.c`：`CURLOPT_LOW_SPEED_LIMIT 1L` / `CURLOPT_LOW_SPEED_TIME 10L` |
 | 教育网联合镜像站不在 Arch 官方 mirror status 列表中 | `https://archlinux.org/mirrors/status/json/`，1190 条中 cernet 条目数为 0 |
 | 部分镜像站会断开 `Python-urllib` UA 的请求（即 reflector 失败的真正原因） | 实测 `mirrors.hust.edu.cn`：curl 200；urllib → `RemoteDisconnected`；urllib + `curl/8.14.1` UA → 200 |
+| 只按速度排序会选到过期镜像 | Arch Wiki `Mirrors`：「It is not optimal to only rank mirrors based on speed since the fastest servers might be out-of-sync」 |
+| 只能用 `Last-Modified` 反查 db 来源 | 实测本机 `/var/lib/pacman/sync/core.db` 的 mtime 精确等于镜像上的 `Last-Modified`（2026-10-18 15:47 UTC = aliyun） |
+| `reflector` 支持小数 `--delay` 与逗号多国 `--country` | `reflector --help` / `man reflector`：「n may be an integer or a decimal number」 |
+| `rate-mirrors` 有 `--completion` 与 `--disable-untested-fallback` | `rate-mirrors arch --help`；前者默认 1（排除正在同步的镜像），后者防止全部测速失败时输出未测速镜像 |
 
 ### 实测记录（2026-10-16，CN）
 

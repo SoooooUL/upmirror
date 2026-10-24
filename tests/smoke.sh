@@ -175,5 +175,119 @@ check "normalize_cc: 国家全名 -> 代码" \
 check "neighbor_codes: CN -> 含邻近地区" \
       "$(case "$(neighbor_codes CN)" in *JP*) echo 0 ;; *) echo 1 ;; esac)"
 
+# --- 9. 同步一致性校验 ---
+printf '\n[9] 同步一致性校验\n'
+mkdir -p "$SANDBOX/cache9"
+cat > "$SANDBOX/in9" <<'EOF'
+Server = https://good.example/archlinux/$repo/os/$arch
+Server = https://bad.example/archlinux/$repo/os/$arch
+Server = https://noheader.example/archlinux/$repo/os/$arch
+EOF
+# 假 curl：按 URL 吐伪造响应头（基准 10:00Z；good 落后 5 分钟；bad 落后两天）
+probe_fake_curl() {
+    curl() {
+        local url="" a
+        for a in "$@"; do [[ "$a" == http* ]] && { url="$a"; break; }; done
+        case "$url" in
+            *geo.mirror.pkgbuild.com*) echo 'Last-Modified: Mon, 19 Oct 2026 10:00:00 GMT' ;;
+            *good.example*)            echo 'Last-Modified: Mon, 19 Oct 2026 09:55:00 GMT' ;;
+            *bad.example*)             echo 'Last-Modified: Sat, 17 Oct 2026 10:00:00 GMT' ;;
+            *) return 1 ;;
+        esac
+    }
+}
+(
+    sudo() { fake_sudo "$@"; }
+    CACHE_DIR="$SANDBOX/cache9"; OPT_TOLERANCE=3600; OPT_CHECK=true
+    probe_fake_curl
+    check_mirror_consistency "$SANDBOX/in9" "$SANDBOX/out9"
+) >/dev/null 2>&1
+if grep -q 'good.example' "$SANDBOX/out9" \
+   && grep -q 'bad.example' "$SANDBOX/out9" \
+   && grep -q 'noheader.example' "$SANDBOX/out9"; then
+    check "一致性差的只降序、不剔除（三个都保留）" 0
+else
+    check "一致性差的只降序、不剔除（三个都保留）" 1
+fi
+# 顺序必须是：好 -> 未知 -> 差（输入里 bad 在中间，正确排序应把它挤到最后）
+order="$(sed -E 's#^Server = https://([^/]+)/.*#\1#' "$SANDBOX/out9" | tr '\n' ' ')"
+if [[ "$order" == 'good.example noheader.example bad.example ' ]]; then
+    check "排序为 优先 -> 未知 -> 降序（实际: $order）" 0
+else
+    check "排序为 优先 -> 未知 -> 降序（实际: $order）" 1
+fi
+if grep -q '^Server = https://good.example' "$SANDBOX/out9"; then
+    check "输出仍带 'Server = ' 前缀（回归：曾丢前缀使列表被清空）" 0
+else
+    check "输出仍带 'Server = ' 前缀（回归：曾丢前缀使列表被清空）" 1
+fi
+# 全部滞后时也要保留原顺序（自然退化为不排序）
+printf 'Server = https://bad.example/archlinux/$repo/os/$arch\nServer = https://good.example/archlinux/$repo/os/$arch\n' > "$SANDBOX/in9b"
+(
+    sudo() { fake_sudo "$@"; }
+    CACHE_DIR="$SANDBOX/cache9"; OPT_TOLERANCE=3600
+    probe_fake_curl
+    check_mirror_consistency "$SANDBOX/in9b" "$SANDBOX/out9b"
+) >/dev/null 2>&1
+order="$(sed -E 's#^Server = https://([^/]+)/.*#\1#' "$SANDBOX/out9b" | tr '\n' ' ')"
+if [[ "$order" == 'good.example bad.example ' ]] && (( $(wc -l < "$SANDBOX/out9b") == 2 )); then
+    check "混合滞后时好的优先、差的排后（实际: $order）" 0
+else
+    check "混合滞后时好的优先、差的排后（实际: $order）" 1
+fi
+# 放宽容忍度后 bad 应回到「优先」档，保持输入原顺序
+(
+    sudo() { fake_sudo "$@"; }
+    CACHE_DIR="$SANDBOX/cache9"; OPT_TOLERANCE=999999
+    probe_fake_curl
+    check_mirror_consistency "$SANDBOX/in9b" "$SANDBOX/out9c"
+) >/dev/null 2>&1
+order="$(sed -E 's#^Server = https://([^/]+)/.*#\1#' "$SANDBOX/out9c" | tr '\n' ' ')"
+if [[ "$order" == 'bad.example good.example ' ]]; then
+    check "--tolerance 放宽后不再降序，保持原顺序（实际: $order）" 0
+else
+    check "--tolerance 放宽后不再降序，保持原顺序（实际: $order）" 1
+fi
+
+# --- 10. 备份清理（按文件名，不按 mtime）---
+printf '\n[10] 备份清理\n'
+mkdir -p "$SANDBOX/cache10"
+for i in 01 02 03 04 05; do
+    printf 'x\n' > "$SANDBOX/cache10/mirrorlist.202600${i}-120000.bak"
+done
+# 故意把最旧的那份改成最新 mtime：旧实现按 mtime 排会删错
+# （备份用 cp -p 保留了原文件 mtime，所以排序依据本来就不该是 mtime）
+touch "$SANDBOX/cache10/mirrorlist.20260001-120000.bak"
+ln -sfn mirrorlist.20260005-120000.bak "$SANDBOX/cache10/mirrorlist.latest.bak"
+(
+    CACHE_DIR="$SANDBOX/cache10"; KEEP_BACKUPS=3
+    prune_backups mirrorlist
+)
+remain="$(ls -1 "$SANDBOX/cache10"/*.bak 2>/dev/null | grep -v latest | wc -l)"
+if [[ "$remain" == 3 ]] \
+   && [[ -f "$SANDBOX/cache10/mirrorlist.20260005-120000.bak" ]] \
+   && [[ ! -e "$SANDBOX/cache10/mirrorlist.20260001-120000.bak" ]] \
+   && [[ -L "$SANDBOX/cache10/mirrorlist.latest.bak" ]]; then
+    check "保留最近 3 份、不误删软链、不被 mtime 干扰" 0
+else
+    check "保留最近 3 份、不误删软链、不被 mtime 干扰 (剩 $remain)" 1
+fi
+
+# --- 11. 辅助函数 ---
+printf '\n[11] 辅助函数\n'
+printf 'Server = https://a.example/x\n# Server = https://b.example/x\nServer = garbage\n' \
+    > "$SANDBOX/count11"
+check "server_count 只数合法 Server 行" \
+      "$([[ "$(server_count "$SANDBOX/count11")" == 1 ]] && echo 0 || echo 1)"
+check "fmt_dur: 3725 -> 1h2m" "$([[ "$(fmt_dur 3725)" == 1h2m ]] && echo 0 || echo 1)"
+check "fmt_dur: 负数归零" "$([[ "$(fmt_dur -5)" == 0s ]] && echo 0 || echo 1)"
+
+# --- 12. 默认值（防止被改回宽松设置）---
+printf '\n[12] 默认值\n'
+check "默认 --max-delay = 7200（2h）" "$([[ "$OPT_MAX_DELAY" == 7200 ]] && echo 0 || echo 1)"
+check "默认开启一致性校验" "$([[ "$OPT_CHECK" == true ]] && echo 0 || echo 1)"
+check "默认 --tolerance = 3600" "$([[ "$OPT_TOLERANCE" == 3600 ]] && echo 0 || echo 1)"
+check "默认不自动刷库（--sync 可选）" "$([[ "$OPT_SYNC" == false ]] && echo 0 || echo 1)"
+
 printf '\n=== 结果: %d 通过, %d 失败 ===\n\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]
