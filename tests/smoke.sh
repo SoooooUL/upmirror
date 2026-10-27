@@ -282,12 +282,75 @@ check "server_count 只数合法 Server 行" \
 check "fmt_dur: 3725 -> 1h2m" "$([[ "$(fmt_dur 3725)" == 1h2m ]] && echo 0 || echo 1)"
 check "fmt_dur: 负数归零" "$([[ "$(fmt_dur -5)" == 0s ]] && echo 0 || echo 1)"
 
-# --- 12. 默认值（防止被改回宽松设置）---
+# --- 12. 默认值（防止被改回会导致候选过少的设置）---
 printf '\n[12] 默认值\n'
-check "默认 --max-delay = 7200（2h）" "$([[ "$OPT_MAX_DELAY" == 7200 ]] && echo 0 || echo 1)"
+check "默认 --max-delay = 86400（24h）" "$([[ "$OPT_MAX_DELAY" == 86400 ]] && echo 0 || echo 1)"
 check "默认开启一致性校验" "$([[ "$OPT_CHECK" == true ]] && echo 0 || echo 1)"
 check "默认 --tolerance = 3600" "$([[ "$OPT_TOLERANCE" == 3600 ]] && echo 0 || echo 1)"
 check "默认不自动刷库（--sync 可选）" "$([[ "$OPT_SYNC" == false ]] && echo 0 || echo 1)"
+
+# --- 13. 备份失败必须中止（回归：曾继续裸写，中断后无法回滚）---
+printf '\n[13] 备份失败中止\n'
+(
+    CACHE_DIR="$SANDBOX/cache13"; mkdir -p "$CACHE_DIR"
+    target13="$SANDBOX/target13.conf"; printf 'ORIGINAL\n' > "$target13"
+    # 只让备份用的 `cp -p` 失败，其余 sudo 调用照常
+    sudo() {
+        case "$1" in
+            chown|-v) return 0 ;;
+            cp) [[ "${2:-}" == -p ]] && return 1 ;;
+        esac
+        "$@"
+    }
+    register_target "$target13"
+) 2>/dev/null
+rc=$?
+if [[ $rc == 1 && "$(cat "$SANDBOX/target13.conf")" == ORIGINAL ]]; then
+    check "备份失败时中止，原文件未被覆盖" 0
+else
+    check "备份失败时中止，原文件未被覆盖 (rc=$rc)" 1
+fi
+
+# --- 14. 中断清理（回归：Ctrl-C 会残留 probe.XXXXXX）---
+printf '\n[14] 中断清理\n'
+(
+    CACHE_DIR="$SANDBOX/cache14"; mkdir -p "$CACHE_DIR"
+    d="$(mktemp -d "$CACHE_DIR/probe.XXXXXX")"
+    PROBE_DIRS+=("$d")
+    printf '%s\n' "$d" > "$SANDBOX/probe_path"
+    trap cleanup EXIT INT TERM HUP
+    # $$ 在子 shell 里仍是父进程 PID，必须用 BASHPID
+    kill -INT "$BASHPID"
+)
+probe_path="$(cat "$SANDBOX/probe_path" 2>/dev/null || true)"
+if [[ -n "$probe_path" && ! -d "$probe_path" ]]; then
+    check "Ctrl-C 后探测目录被清理" 0
+else
+    check "Ctrl-C 后探测目录被清理 (残留: ${probe_path:-未记录})" 1
+fi
+
+# --- 15. 头部元数据 ---
+printf '\n[15] 头部元数据\n'
+printf 'Server = https://a.example/x\n' > "$SANDBOX/src15"
+compose_list "$SANDBOX/src15" "$SANDBOX/out15" rate-mirrors CN CN "$FALLBACK_MIRROR"
+if grep -qx '## Region: CN' "$SANDBOX/out15"; then
+    check "单国模式不重复 candidates" 0
+else
+    check "单国模式不重复 candidates" 1
+fi
+compose_list "$SANDBOX/src15" "$SANDBOX/out15n" rate-mirrors CN "CN,HK" "$FALLBACK_MIRROR"
+if grep -qx '## Region: CN (candidates: CN,HK)' "$SANDBOX/out15n"; then
+    check "--neighbors 模式列出候选地区" 0
+else
+    check "--neighbors 模式列出候选地区" 1
+fi
+compose_list "$SANDBOX/src15" "$SANDBOX/out15c" rate-mirrors archlinuxcn "" "$FALLBACK_CN_MIRROR" "n/a"
+if grep -qx '## Region: archlinuxcn' "$SANDBOX/out15c" \
+   && grep -q 'max-delay=n/a' "$SANDBOX/out15c"; then
+    check "archlinuxcn 不声称地区过滤，延迟标 n/a" 0
+else
+    check "archlinuxcn 不声称地区过滤，延迟标 n/a" 1
+fi
 
 printf '\n=== 结果: %d 通过, %d 失败 ===\n\n' "$PASS" "$FAIL"
 [[ "$FAIL" == 0 ]]

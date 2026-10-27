@@ -51,6 +51,13 @@ might be out-of-sync."* 但比「整个镜像旧」更阴的是**只同步了一
 `last_sync` / `delay`，只能说明「最近同步过」，**盖不住单个仓库的滞后**：
 阿里云当时 `delay` 约 8.6 小时，小于原先 12 小时的阈值，顺利通过筛选。
 
+也正因为 `delay` 只是粗筛，`--max-delay` 不该收得太紧：2026-10-27 实测
+官方 mirror status 里 CN 的 https 镜像只有 18 个，其中同步完成
+（`completion_pct = 1`）的只有 7 个，再要求 `delay <= 2h` 就只剩 3 个 ——
+这就是「列表长期只有几个镜像」的根因。现在默认值与 rate-mirrors 自身一致
+（24h），过期的镜像交给一致性校验按真实 `core.db` / `extra.db` 时间戳降序；
+`completion = 1` 仍然保留，正在同步中的镜像本来就不该写入列表。
+
 所以 upmirror 现在直接探测各镜像 `core.db` / `extra.db` 的 `Last-Modified`，
 以官方 `geo.mirror.pkgbuild.com` 为基准逐个比对。
 
@@ -101,7 +108,7 @@ upmirror -y                       # 跳过交互确认（适合定时任务）
 |---|---|---|
 | `-c, --country <CC>` | 国家/地区 ISO 代码（也接受国家全名） | 自动检测 |
 | `-n, --mirrors <N>` | 写入列表的服务器数量 | 10 |
-| `--max-delay <SEC>` | 镜像最大同步延迟 | 7200（2h） |
+| `--max-delay <SEC>` | 镜像最大同步延迟 | 86400（24h） |
 | `--protocol <P>` | `https` / `http` / `both` | https |
 | `--concurrency <N>` | 并发测速数 | 16 |
 | `--per-country <N>` | 每国测速镜像数 | 5 |
@@ -147,6 +154,9 @@ mirrorlist.latest.bak -> ...        # 最近一次
   mirrorlist 之后删错文件）；`latest.bak` 是软链，不占备份份数。
 - 脚本被 `Ctrl-C`、被 kill 或中途出错时，会自动从备份恢复原文件；
   如果目标文件原本不存在，则删除新建的文件。
+- **备份失败会直接中止**（如权限、磁盘满）：没有备份的覆盖一旦中断就再也
+  恢复不了，所以此时宁可什么都不写。
+- 一致性校验的探测临时目录也会在中断时清理，不在 `~/.cache/upmirror` 留垃圾。
 - `--dry-run` 不涉及任何写入，自然也不会触发回滚。
 
 ## 测试
@@ -162,6 +172,9 @@ bash tests/smoke.sh
 另外用假的 `curl` 注入伪造的 `Last-Modified`，覆盖一致性校验的
 「优先 / 未知 / 降序」三档排序 / `--tolerance` 放宽」四条分支，
 以及备份清理的排序行为（含「软链不计数」「不被 mtime 干扰」）。
+
+回归项：备份失败必须中止（不允许裸写）、`Ctrl-C` 后探测目录不残留、
+单国模式头部不重复 `candidates`。
 
 ## 实现依据（源码/实测核对）
 

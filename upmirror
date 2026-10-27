@@ -22,7 +22,7 @@
 set -uo pipefail
 
 PROG="${0##*/}"
-VERSION="1.1.0"
+VERSION="1.2.0"
 
 # ---------- 路径与常量 ----------
 TARGET_MIRRORLIST="/etc/pacman.d/mirrorlist"
@@ -53,7 +53,11 @@ readonly ARCH="$(uname -m)"
 # ---------- 默认选项 ----------
 OPT_CC=""                # 国家/地区 ISO 代码，空 = 自动检测
 OPT_MIRRORS=10           # 写入 mirrorlist 的镜像数量
-OPT_MAX_DELAY=7200       # 最大同步延迟（秒），2 小时
+# 默认 24h，与 rate-mirrors 自身默认值一致。别再收窄：CN 的 https 镜像里
+# 同步完成（completion=1）的只有个位数，2h 会把候选砍到 3 个甚至 1 个。
+# 真正过期的镜像由下面的「一致性校验」按 core/extra 的实际 Last-Modified 降序，
+# 比镜像站自报的整体 delay 精确得多，不需要这里再硬卡。
+OPT_MAX_DELAY=86400      # 最大同步延迟（秒），24 小时
 OPT_CHECK=true           # 写入前做同步一致性校验（防部分升级）
 OPT_TOLERANCE=3600       # 一致性校验容忍的落后秒数，1 小时
 OPT_SYNC=false           # 写入后执行 pacman -Syy 强制刷库
@@ -80,7 +84,7 @@ declare -A M_ZH=(
     [opt_title]="选项："
     [help_cc]="手动指定国家/地区 ISO 代码（如 CN、JP、US）"
     [help_mirrors]="写入镜像列表的服务器数量（默认 10）"
-    [help_delay]="镜像最大同步延迟秒数（默认 7200 = 2 小时）"
+    [help_delay]="镜像最大同步延迟秒数（默认 86400 = 24 小时）"
     [help_proto]="测速使用的协议：https | http | both（默认 https）"
     [help_conc]="并发测速数（默认 16）"
     [help_per_country]="每个国家测速的镜像数量（默认 5）"
@@ -105,6 +109,7 @@ declare -A M_ZH=(
     [check_all_ok]="全部候选镜像均与官方同步"
     [check_demoted]="一致性较差的镜像已排到列表末尾"
     [few_mirrors]="实际写入的镜像少于 --mirrors，可用镜像不足（--mirrors 是上限）"
+    [few_mirrors_hint]="可加 --neighbors 纳入邻近地区，或调小 --mirrors"
     [sync_running]="正在强制刷新 pacman 数据库..."
     [sync_ok]="数据库已刷新"
     [sync_fail]="刷新数据库失败（镜像列表已写入，可稍后手动执行 pacman -Syy）"
@@ -151,6 +156,8 @@ declare -A M_ZH=(
     [err_bad_proto]="协议只能是 https、http 或 both"
     [err_bad_backend]="后端只能是 auto、rate-mirrors 或 reflector"
     [err_no_write]="写入失败"
+    [err_backup]="无法备份目标文件，已中止（继续写入将无法回滚）"
+    [cn_need_tool]="更新 archlinuxcn 需要 rate-mirrors，已跳过"
 )
 
 declare -A M_EN=(
@@ -158,7 +165,7 @@ declare -A M_EN=(
     [opt_title]="Options:"
     [help_cc]="Set country/region ISO code manually (e.g. CN, JP, US)"
     [help_mirrors]="Number of servers to write into the mirrorlist (default 10)"
-    [help_delay]="Max mirror sync delay in seconds (default 7200 = 2h)"
+    [help_delay]="Max mirror sync delay in seconds (default 86400 = 24h)"
     [help_proto]="Protocol used for speed test: https | http | both (default https)"
     [help_conc]="Number of simultaneous speed tests (default 16)"
     [help_per_country]="Number of mirrors to test per country (default 5)"
@@ -183,6 +190,7 @@ declare -A M_EN=(
     [check_network]="More than half of the mirrors gave no timestamp (local network issue?); they are kept as unknown"
     [check_demoted]="Out-of-sync mirrors were moved to the end of the list"
     [few_mirrors]="Wrote fewer mirrors than --mirrors asked for, not enough candidates available"
+    [few_mirrors_hint]="Try --neighbors to include nearby regions, or lower --mirrors"
     [sync_running]="Force refreshing the pacman database..."
     [sync_ok]="Database refreshed"
     [sync_fail]="Refresh failed (mirrorlist was written; run pacman -Syy manually later)"
@@ -229,6 +237,8 @@ declare -A M_EN=(
     [err_bad_proto]="Protocol must be https, http or both"
     [err_bad_backend]="Backend must be auto, rate-mirrors or reflector"
     [err_no_write]="Write failed"
+    [err_backup]="Cannot back up the target file, aborting (writing now would leave no way to roll back)"
+    [cn_need_tool]="Updating archlinuxcn requires rate-mirrors, skipped"
 )
 
 # 取本地化字符串
@@ -254,8 +264,9 @@ die()   { err "$*"; exit 1; }
 have() { command -v "$1" >/dev/null 2>&1; }
 
 # ---------- 回滚/清理机制 ----------
-declare -a RB_TARGETS=() RB_BACKUPS=() RB_STATE=()   # 状态: yes(原本存在) / no(原本不存在) / unknown(备份失败)
+declare -a RB_TARGETS=() RB_BACKUPS=() RB_STATE=()   # 状态: yes(原本存在) / no(原本不存在)
 declare -a TMP_FILES=()
+declare -a PROBE_DIRS=()    # probe_all 的临时目录，中断时也要清掉
 declare -a ATOMIC_TMPS=()   # install_atomic 用过的临时路径，退出时兜底清理
 SCRIPT_OK=false
 
@@ -286,8 +297,9 @@ register_target() {
             ln -sfn "$(basename "$bak")" "$CACHE_DIR/$(basename "$target").latest.bak" 2>/dev/null || true
             prune_backups "$(basename "$target")"
         else
-            RB_TARGETS+=("$target"); RB_BACKUPS+=(""); RB_STATE+=("unknown")
-            warn "backup failed: $target"
+            # 备份失败绝不能继续：install_atomic 会覆盖原文件，之后任何中断或
+            # 后续步骤失败都没有备份可回滚 —— 那正是最需要回滚的场景。
+            die "$(msg err_backup): $target"
         fi
     else
         RB_TARGETS+=("$target"); RB_BACKUPS+=(""); RB_STATE+=("no")
@@ -324,11 +336,16 @@ cleanup() {
                 no)
                     sudo rm -f -- "${RB_TARGETS[$i]}" && ok "$(msg removed_new) ${RB_TARGETS[$i]}"
                     ;;
-                *) : ;;   # 备份失败，保持原样不动
+                *) : ;;   # 不应出现（备份失败已在 register_target 中 die）
             esac
         done
     fi
     clean_tmp
+    # 一致性校验的探测目录：正常路径已删；被 Ctrl-C 打断时靠这里兜底
+    local d
+    for d in "${PROBE_DIRS[@]:-}"; do
+        [[ -n "$d" && -d "$d" ]] && rm -rf -- "$d"
+    done
     # install_atomic 中途失败残留的半成品（sudo 属主，必须 sudo 删）
     local f
     for f in "${ATOMIC_TMPS[@]:-}"; do
@@ -768,6 +785,7 @@ check_mirror_consistency() {   # $1=输入列表 $2=输出列表
     printf '\n%s%s%s\n' "$C_CYAN" "$(msg check_title)" "$C_NC"
 
     local dir; dir="$(mktemp -d "$CACHE_DIR/probe.XXXXXX")" || { cp -- "$in" "$out"; return 0; }
+    PROBE_DIRS+=("$dir")
     # 基准和候选镜像一起并行探测：基准不再单独串行占一份超时
     probe_all "$dir" "$BASELINE_MIRROR" "${urls[@]}"
 
@@ -832,17 +850,21 @@ check_mirror_consistency() {   # $1=输入列表 $2=输出列表
     return 0
 }
 
-# 生成带头部注释的最终文件；$6 为保底镜像地址（可为空）
+# 生成带头部注释的最终文件；$6 为保底镜像地址（可为空），$7 覆盖 max-delay 标签
 compose_list() {
-    local src="$1" dst="$2" backend="$3" cc="$4" filter="$5" fallback="${6:-}"
+    local src="$1" dst="$2" backend="$3" cc="$4" filter="$5" fallback="${6:-}" max_delay_tag="${7:-${OPT_MAX_DELAY}s}"
+    # 单国模式下 filter 与 cc 相同，再写 "(candidates: CN)" 只是噪音；
+    # 只有 --neighbors 真正带来额外候选时才值得列出。
+    local region="${cc:-auto/global}"
+    [[ -n "$filter" && "$filter" != "$cc" ]] && region+=" (candidates: $filter)"
     {
         printf '##\n'
         printf '## Arch Linux repository mirrorlist\n'
         printf '##\n'
         printf '## Generated by upmirror %s on %s\n' "$VERSION" "$(date '+%Y-%m-%d %H:%M:%S %Z')"
-        printf '## Backend: %s | protocol=%s | max-delay=%ss | mirrors=%s\n' \
-               "$backend" "$OPT_PROTOCOL" "$OPT_MAX_DELAY" "$OPT_MIRRORS"
-        printf '## Region: %s\n' "${cc:-auto/global}${filter:+ (candidates: $filter)}"
+        printf '## Backend: %s | protocol=%s | max-delay=%s | mirrors=%s\n' \
+               "$backend" "$OPT_PROTOCOL" "$max_delay_tag" "$OPT_MIRRORS"
+        printf '## Region: %s\n' "$region"
         printf '##\n\n'
         # reflector 兼容行：sysup 等工具靠它判断镜像源时效（格式必须是
         # "YYYY-MM-DD HH:MM:SS UTC"，且必须用单个 # 开头）
@@ -871,6 +893,45 @@ install_atomic() {
     # 中途失败：立刻清掉半成品，不留 sudo 属主的残留文件
     sudo rm -f -- "$tmp" 2>/dev/null
     return 1
+}
+
+# 可选：更新 archlinuxcn 镜像列表（该仓库只有 rate-mirrors 支持）
+update_cn_mirrorlist() {
+    local tmp_cn final_cn
+    new_tmp tmp_cn cn
+    # 父级参数与主列表对齐：并发、输出上限、协议过滤，以及
+    # --disable-untested-fallback（防止全部测速失败时写入未测速镜像）。
+    local -a cmd=(rate-mirrors
+                  --concurrency="$OPT_CONCURRENCY"
+                  --max-mirrors-to-output="$OPT_MIRRORS"
+                  --disable-comments-in-file
+                  --disable-untested-fallback
+                  --save="$tmp_cn")
+    case "$OPT_PROTOCOL" in
+        https) cmd+=(--protocol=https) ;;
+        http)  cmd+=(--protocol=http) ;;
+        both)  cmd+=(--protocol=http --protocol=https) ;;
+    esac
+    # archlinuxcn 的镜像不按地区筛，也不支持 --completion/--max-delay
+    # （该子命令只接受 --fetch-mirrors-timeout/--mirror-list-file/--path-to-test/
+    # --arch/--comment-prefix，加错会直接 Usage 报错），所以头部 max-delay 标 n/a。
+    if "${cmd[@]}" archlinuxcn 2>/dev/null \
+       && validate_list "$tmp_cn"; then
+        register_target "$TARGET_CN_MIRRORLIST"
+        new_tmp final_cn cnfinal
+        compose_list "$tmp_cn" "$final_cn" "rate-mirrors" "archlinuxcn" "" "$FALLBACK_CN_MIRROR" "n/a"
+        if install_atomic "$final_cn" "$TARGET_CN_MIRRORLIST"; then
+            ok "$(msg cn_updated) ${C_GREEN}$TARGET_CN_MIRRORLIST${C_NC}"
+            if ! awk '/^\[archlinuxcn\]/{f=1;next} /^\[/{f=0} f' "$PACMAN_CONF" 2>/dev/null \
+                 | grep -qE '^[[:space:]]*Include[[:space:]]*='; then
+                printf '\n'
+                warn "$(msg cn_hint1)"
+                printf '        %s\n' "$(msg cn_hint2)"
+            fi
+        fi
+    else
+        warn "$(msg cn_failed)"
+    fi
 }
 
 # ---------- 主流程 ----------
@@ -925,7 +986,7 @@ main() {
     LOG_FILE="$CACHE_DIR/last-run.log"
     # 单一 trap：负责临时文件清理 + 失败的镜像列表回滚
     trap cleanup EXIT INT TERM HUP
-    local tmp_list tmp_cn checked
+    local tmp_list checked
     new_tmp tmp_list list
 
     # 5. 测速生成
@@ -947,6 +1008,10 @@ main() {
     n_servers="$(server_count "$checked")"
     if (( n_servers < OPT_MIRRORS )); then
         info "$(msg few_mirrors): ${n_servers} < ${OPT_MIRRORS}"
+        # 纯单国模式下候选池可能天然小于 --mirrors，给出可操作的下一步
+        if [[ "$OPT_NEIGHBORS" != true && -n "$cc" ]]; then
+            info "  $(msg few_mirrors_hint)"
+        fi
     fi
 
     # 6. 组装最终内容（头部注释 + 镜像 + 保底）
@@ -975,28 +1040,12 @@ main() {
     fi
     ok "$(msg written) ${C_GREEN}$TARGET_MIRRORLIST${C_NC}"
 
-    # 10. 可选：archlinuxcn
+    # 10. 可选：archlinuxcn（只有 rate-mirrors 支持该仓库）
     if [[ "$OPT_CN" == true ]]; then
-        new_tmp tmp_cn cn
-        if rate-mirrors --concurrency="$OPT_CONCURRENCY" \
-                        --max-mirrors-to-output="$OPT_MIRRORS" \
-                        --disable-comments-in-file \
-                        --save="$tmp_cn" archlinuxcn 2>/dev/null \
-           && validate_list "$tmp_cn"; then
-            register_target "$TARGET_CN_MIRRORLIST"
-            new_tmp final_cn cnfinal
-            compose_list "$tmp_cn" "$final_cn" "rate-mirrors" "archlinuxcn" "$filter" "$FALLBACK_CN_MIRROR"
-            if install_atomic "$final_cn" "$TARGET_CN_MIRRORLIST"; then
-                ok "$(msg cn_updated) ${C_GREEN}$TARGET_CN_MIRRORLIST${C_NC}"
-                if ! awk '/^\[archlinuxcn\]/{f=1;next} /^\[/{f=0} f' "$PACMAN_CONF" 2>/dev/null \
-                     | grep -qE '^[[:space:]]*Include[[:space:]]*='; then
-                    printf '\n'
-                    warn "$(msg cn_hint1)"
-                    printf '        %s\n' "$(msg cn_hint2)"
-                fi
-            fi
+        if have rate-mirrors; then
+            update_cn_mirrorlist
         else
-            warn "$(msg cn_failed)"
+            warn "$(msg cn_need_tool)"
         fi
     fi
 
