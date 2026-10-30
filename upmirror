@@ -58,6 +58,12 @@ OPT_MIRRORS=10           # 写入 mirrorlist 的镜像数量
 # 真正过期的镜像由下面的「一致性校验」按 core/extra 的实际 Last-Modified 降序，
 # 比镜像站自报的整体 delay 精确得多，不需要这里再硬卡。
 OPT_MAX_DELAY=86400      # 最大同步延迟（秒），24 小时
+# 同步完成度下限（0~1，rate-mirrors 后端的 --completion）。
+# 默认不取 1：CN 的镜像长期停在 0.96~0.99（同步进行中），取 1 会让候选池
+# 只剩 3 个（实测 2026-10-27，ustc/nju/aliyun），jlu/hit/xjtu/sjtug 全被滤掉。
+# completion<1 的实际后果是少数包文件还没到站，pacman 会 404 后自动换下一个
+# Server；db 之间的不一致由一致性校验负责挡。想严格按官方建议可以传 --completion 1。
+OPT_COMPLETION=0.95
 OPT_CHECK=true           # 写入前做同步一致性校验（防部分升级）
 OPT_TOLERANCE=3600       # 一致性校验容忍的落后秒数，1 小时
 OPT_SYNC=false           # 写入后执行 pacman -Syy 强制刷库
@@ -85,6 +91,7 @@ declare -A M_ZH=(
     [help_cc]="手动指定国家/地区 ISO 代码（如 CN、JP、US）"
     [help_mirrors]="写入镜像列表的服务器数量（默认 10）"
     [help_delay]="镜像最大同步延迟秒数（默认 86400 = 24 小时）"
+    [help_completion]="镜像同步完成度下限 0~1（默认 0.95；1 = 只接受完全同步）"
     [help_proto]="测速使用的协议：https | http | both（默认 https）"
     [help_conc]="并发测速数（默认 16）"
     [help_per_country]="每个国家测速的镜像数量（默认 5）"
@@ -152,6 +159,7 @@ declare -A M_ZH=(
     [err_unknown_opt]="未知选项"
     [err_need_arg]="选项缺少参数"
     [err_bad_int]="需要一个非负整数"
+    [err_bad_ratio]="需要一个 0~1 之间的小数"
     [err_bad_cc]="无法识别的国家/地区"
     [err_bad_proto]="协议只能是 https、http 或 both"
     [err_bad_backend]="后端只能是 auto、rate-mirrors 或 reflector"
@@ -166,6 +174,7 @@ declare -A M_EN=(
     [help_cc]="Set country/region ISO code manually (e.g. CN, JP, US)"
     [help_mirrors]="Number of servers to write into the mirrorlist (default 10)"
     [help_delay]="Max mirror sync delay in seconds (default 86400 = 24h)"
+    [help_completion]="Minimum mirror sync completion 0-1 (default 0.95; 1 = fully synced only)"
     [help_proto]="Protocol used for speed test: https | http | both (default https)"
     [help_conc]="Number of simultaneous speed tests (default 16)"
     [help_per_country]="Number of mirrors to test per country (default 5)"
@@ -233,6 +242,7 @@ declare -A M_EN=(
     [err_unknown_opt]="Unknown option"
     [err_need_arg]="Option requires an argument"
     [err_bad_int]="requires a non-negative integer"
+    [err_bad_ratio]="requires a number between 0 and 1"
     [err_bad_cc]="Unrecognized country/region"
     [err_bad_proto]="Protocol must be https, http or both"
     [err_bad_backend]="Backend must be auto, rate-mirrors or reflector"
@@ -366,6 +376,7 @@ $(msg opt_title)
   -c, --country <CC>       $(msg help_cc)
   -n, --mirrors <N>        $(msg help_mirrors)
       --max-delay <SEC>    $(msg help_delay)
+      --completion <R>     $(msg help_completion)
       --protocol <P>       $(msg help_proto)
       --concurrency <N>    $(msg help_conc)
       --per-country <N>    $(msg help_per_country)
@@ -398,6 +409,7 @@ $(msg opt_title)
   -c, --country <CC>       $(msg help_cc)
   -n, --mirrors <N>        $(msg help_mirrors)
       --max-delay <SEC>    $(msg help_delay)
+      --completion <R>     $(msg help_completion)
       --protocol <P>       $(msg help_proto)
       --concurrency <N>    $(msg help_conc)
       --per-country <N>    $(msg help_per_country)
@@ -428,6 +440,10 @@ need_int() {   # $1=选项名 $2=值
     [[ "${2:-}" =~ ^[0-9]+$ ]] || die "$1 $(msg err_bad_int)"
 }
 
+need_ratio() {   # $1=选项名 $2=值（0~1 的小数，rate-mirrors 的 --completion）
+    [[ "${2:-}" =~ ^(0(\.[0-9]+)?|1(\.0+)?)$ ]] || die "$1 $(msg err_bad_ratio)"
+}
+
 parse_args() {
     while [[ $# -gt 0 ]]; do
         case "$1" in
@@ -436,6 +452,7 @@ parse_args() {
             -c|--country)    shift; OPT_CC="${1:-}"; [[ -n "$OPT_CC" ]] || die "--country $(msg err_need_arg)" ;;
             -n|--mirrors)    shift; need_int "--mirrors" "${1:-}"; OPT_MIRRORS="$1" ;;
             --max-delay)     shift; need_int "--max-delay" "${1:-}"; OPT_MAX_DELAY="$1" ;;
+            --completion)    shift; need_ratio "--completion" "${1:-}"; OPT_COMPLETION="$1" ;;
             --protocol)      shift; OPT_PROTOCOL="${1:-}" ;;
             --concurrency)   shift; need_int "--concurrency" "${1:-}"; OPT_CONCURRENCY="$1" ;;
             --per-country)   shift; need_int "--per-country" "${1:-}"; OPT_PER_COUNTRY="$1" ;;
@@ -637,9 +654,9 @@ generate_list() {
                 both)  cmd+=(--protocol=http --protocol=https) ;;
             esac
             [[ -n "$filter" ]] && cmd+=(--include-countries="$filter")
-            # --completion=1：正在同步中的镜像（completion < 1）直接排除
+            # --completion：默认 0.95，见 OPT_COMPLETION 处的说明
             # --max-delay：只要最近同步过的，语义与 OPT_MAX_DELAY 一致
-            cmd+=(arch --completion=1 --max-delay="$OPT_MAX_DELAY")
+            cmd+=(arch --completion="$OPT_COMPLETION" --max-delay="$OPT_MAX_DELAY")
             ;;
         reflector)
             # reflector 的 --country 支持逗号多国，所以 --neighbors 在这里也能生效

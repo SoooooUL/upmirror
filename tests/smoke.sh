@@ -285,6 +285,7 @@ check "fmt_dur: 负数归零" "$([[ "$(fmt_dur -5)" == 0s ]] && echo 0 || echo 1
 # --- 12. 默认值（防止被改回会导致候选过少的设置）---
 printf '\n[12] 默认值\n'
 check "默认 --max-delay = 86400（24h）" "$([[ "$OPT_MAX_DELAY" == 86400 ]] && echo 0 || echo 1)"
+check "默认 --completion = 0.95" "$([[ "$OPT_COMPLETION" == 0.95 ]] && echo 0 || echo 1)"
 check "默认开启一致性校验" "$([[ "$OPT_CHECK" == true ]] && echo 0 || echo 1)"
 check "默认 --tolerance = 3600" "$([[ "$OPT_TOLERANCE" == 3600 ]] && echo 0 || echo 1)"
 check "默认不自动刷库（--sync 可选）" "$([[ "$OPT_SYNC" == false ]] && echo 0 || echo 1)"
@@ -350,6 +351,45 @@ if grep -qx '## Region: archlinuxcn' "$SANDBOX/out15c" \
     check "archlinuxcn 不声称地区过滤，延迟标 n/a" 0
 else
     check "archlinuxcn 不声称地区过滤，延迟标 n/a" 1
+fi
+
+# --- 16. --completion 参数 ---
+printf '\n[16] 完成度参数\n'
+(
+    OPT_COMPLETION=1
+    parse_args --completion 0.9
+    [[ "$OPT_COMPLETION" == 0.9 ]]
+)
+check "--completion 0.9 被接受" $?
+(
+    OPT_COMPLETION=0.95
+    parse_args --completion 1.5
+) >/dev/null 2>&1
+check "--completion 1.5 被拒绝" "$([[ $? != 0 ]] && echo 0 || echo 1)"
+(
+    OPT_COMPLETION=0.95
+    parse_args --completion 1
+    [[ "$OPT_COMPLETION" == 1 ]]
+)
+check "--completion 1 被接受" $?
+# 命令构造：completion 与 max-delay 必须真正传给 rate-mirrors
+(
+    CACHE_DIR="$SANDBOX/cache16"; mkdir -p "$CACHE_DIR"
+    OPT_COMPLETION=0.95; OPT_MAX_DELAY=86400; OPT_PROTOCOL=https
+    OPT_CONCURRENCY=16; OPT_PER_COUNTRY=5; OPT_MIRRORS=10; OPT_QUIET=false
+    rate-mirrors() {
+        printf '%s\n' "$*" > "$SANDBOX/args16"
+        local a save=""
+        for a in "$@"; do [[ "$a" == --save=* ]] && save="${a#--save=}"; done
+        printf 'Server = https://fake.example/archlinux/$repo/os/$arch\n' > "$save"
+    }
+    generate_list "$SANDBOX/out16" rate-mirrors CN CN
+) >/dev/null 2>&1
+if grep -q -- '--completion=0.95' "$SANDBOX/args16" \
+   && grep -q -- '--max-delay=86400' "$SANDBOX/args16"; then
+    check "generate_list 把 completion/max-delay 传给后端" 0
+else
+    check "generate_list 把 completion/max-delay 传给后端" 1
 fi
 
 printf '\n=== 结果: %d 通过, %d 失败 ===\n\n' "$PASS" "$FAIL"

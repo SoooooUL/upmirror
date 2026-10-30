@@ -53,10 +53,21 @@ might be out-of-sync."* 但比「整个镜像旧」更阴的是**只同步了一
 
 也正因为 `delay` 只是粗筛，`--max-delay` 不该收得太紧：2026-10-27 实测
 官方 mirror status 里 CN 的 https 镜像只有 18 个，其中同步完成
-（`completion_pct = 1`）的只有 7 个，再要求 `delay <= 2h` 就只剩 3 个 ——
-这就是「列表长期只有几个镜像」的根因。现在默认值与 rate-mirrors 自身一致
-（24h），过期的镜像交给一致性校验按真实 `core.db` / `extra.db` 时间戳降序；
-`completion = 1` 仍然保留，正在同步中的镜像本来就不该写入列表。
+（`completion_pct = 1`）的只有 4~7 个（随同步窗口波动），再要求
+`delay <= 2h` 就只剩 3 个 —— 这就是「列表长期只有几个镜像」的根因。
+现在默认值与 rate-mirrors 自身一致（24h），过期的镜像交给一致性校验
+按真实 `core.db` / `extra.db` 时间戳降序。
+
+完成度同理，`--completion` 默认取 **0.95** 而不是 rate-mirrors 的 1.0。
+CN 的镜像长期停在 0.96~0.99（同步进行中），取 1.0 时 18 个 https 镜像里
+只剩 3~4 个 —— 2026-10-27 实测：只有 `ustc`/`nju`/`aliyun` 是 1.0，
+`jlu` 0.989、`hit` 0.978、`xjtu` 0.978、`sjtug` 0.978 全被滤掉，
+这就是「CN 源明明有好几个，列表里却只有两三个」的原因。取 0.95 后
+同一时刻能拿到 9 个。
+
+`completion < 1` 的实际后果是少数包文件尚未到站，pacman 下载时 404
+会自动换下一个 Server；db 之间的不一致仍由一致性校验负责。想严格遵循
+Arch Wiki「completion < 1 的镜像不该用」的建议，传 `--completion 1`。
 
 所以 upmirror 现在直接探测各镜像 `core.db` / `extra.db` 的 `Last-Modified`，
 以官方 `geo.mirror.pkgbuild.com` 为基准逐个比对。
@@ -109,6 +120,7 @@ upmirror -y                       # 跳过交互确认（适合定时任务）
 | `-c, --country <CC>` | 国家/地区 ISO 代码（也接受国家全名） | 自动检测 |
 | `-n, --mirrors <N>` | 写入列表的服务器数量 | 10 |
 | `--max-delay <SEC>` | 镜像最大同步延迟 | 86400（24h） |
+| `--completion <R>` | 镜像同步完成度下限（0~1，仅 rate-mirrors 后端） | 0.95 |
 | `--protocol <P>` | `https` / `http` / `both` | https |
 | `--concurrency <N>` | 并发测速数 | 16 |
 | `--per-country <N>` | 每国测速镜像数 | 5 |
